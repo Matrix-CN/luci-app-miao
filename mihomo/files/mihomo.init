@@ -1,3 +1,4 @@
+cat << 'EOF' > /etc/init.d/mihomo
 #!/bin/sh /etc/rc.common
 # Copyright (C) 2026 ImmortalWrt.org
 
@@ -8,13 +9,15 @@ USE_PROCD=1
 PROG="/usr/libexec/mihomo-core"
 CONF_DIR="/etc/mihomo"
 NFT_TABLE="mihomo"
+NFT_FILE="/tmp/mihomo.nft"
 FW_MARK="0x162"
+ROUTING_MARK="666"
 RT_TABLE="162"
 MIHOMO_UID="7890"
 
-format_nft_list() {
-	local item
-	local res=""
+# 将空格分隔的列表转为 nftables 带引号集合: "br-lan", "eth1"
+to_nft_str_set() {
+	local item res=""
 	for item in $1; do
 		[ -n "$res" ] && res="${res}, "
 		res="${res}\"${item}\""
@@ -22,9 +25,9 @@ format_nft_list() {
 	echo "$res"
 }
 
-format_raw_list() {
-	local item
-	local res=""
+# 将空格分隔的列表转为 nftables 原始集合: 192.168.100.0/24, 10.0.0.1
+to_nft_raw_set() {
+	local item res=""
 	for item in $1; do
 		[ -n "$res" ] && res="${res}, "
 		res="${res}${item}"
@@ -33,54 +36,57 @@ format_raw_list() {
 }
 
 setup_firewall() {
-	local proxy_mode proxy_ifaces proxy_udp tproxy_port dns_port bypass_ips bypass_src_macs
-	config_get proxy_mode "config" "proxy_mode" "tproxy"
-	config_get proxy_ifaces "config" "proxy_ifaces" ""
-	config_get_bool proxy_udp "config" "proxy_udp" 1
-	config_get tproxy_port "config" "tproxy_port" "7893"
-	config_get dns_port "config" "dns_port" ""
-	config_get bypass_ips "config" "bypass_ips" ""
-	config_get bypass_src_macs "config" "bypass_src_macs" ""
-
 	cleanup_firewall
 
-	[ "$proxy_mode" = "core_only" ] && return 0
-	[ -z "$proxy_ifaces" ] && {
-		logger -t mihomo "No proxy interfaces selected, skipping firewall setup."
-		return 0
-	}
+	local enabled proxy_mode proxy_ifaces proxy_udp tproxy_port dns_port bypass_ips bypass_src_macs
+	enabled="$(uci -q get mihomo.config.enabled)"
+	[ "$enabled" != "1" ] && return 0
 
-	local nft_ifaces
-	nft_ifaces="$(format_nft_list "$proxy_ifaces")"
+	proxy_mode="$(uci -q get mihomo.config.proxy_mode)"
+	[ -z "$proxy_mode" ] && proxy_mode="tproxy"
+	[ "$proxy_mode" = "core_only" ] && return 0
+
+	proxy_ifaces="$(uci -q get mihomo.config.proxy_ifaces)"
+	if [ -z "$proxy_ifaces" ]; then
+		logger -t mihomo "Error: No proxy_ifaces configured in /etc/config/mihomo"
+		return 1
+	fi
+
+	proxy_udp="$(uci -q get mihomo.config.proxy_udp)"
+	tproxy_port="$(uci -q get mihomo.config.tproxy_port)"
+	[ -z "$tproxy_port" ] && tproxy_port="7893"
+	dns_port="$(uci -q get mihomo.config.dns_port)"
+	bypass_ips="$(uci -q get mihomo.config.bypass_ips)"
+	bypass_src_macs="$(uci -q get mihomo.config.bypass_src_macs)"
+
+	# 自动加载必要内核模块
+	modprobe nft_tproxy 2>/dev/null
+	modprobe nft_socket 2>/dev/null
+
+	# 区分三层接口(如 br-lan)与桥接物理子网口(如 br-lan 下的 eth1)
+	local l3_ifaces=""
+	local br_ports=""
+	local iface
+	for iface in $proxy_ifaces; do
+		if [ -d "/sys/class/net/${iface}/brport" ]; then
+			br_ports="${br_ports} ${iface}"
+			modprobe br_netfilter 2>/dev/null
+			sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1
+			sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null 2>&1
+		else
+			l3_ifaces="${l3_ifaces} ${iface}"
+		fi
+	done
 
 	if [ "$proxy_mode" = "tproxy" ]; then
-		# Policy routing: marked packets routed via loopback
-		ip rule add fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
-		ip route add local default dev lo table "$RT_TABLE" 2>/dev/null
+		# 1. 配置策略路由
+		ip rule del fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
+		ip route flush table "$RT_TABLE" 2>/dev/null
+		ip rule add fwmark "$FW_MARK" table "$RT_TABLE" priority 100
+		ip route add local 0.0.0.0/0 dev lo table "$RT_TABLE"
 
-		local extra_ip_Elements=""
-		[ -n "$bypass_ips" ] && extra_ip_Elements=", $(format_raw_list "$bypass_ips")"
-
-		local mac_bypass_rule=""
-		if [ -n "$bypass_src_macs" ]; then
-			mac_bypass_rule="ether saddr { $(format_raw_list "$bypass_src_macs") } return"
-		fi
-
-		local udp_tproxy_rule=""
-		if [ "$proxy_udp" -eq 1 ]; then
-			udp_tproxy_rule="meta l4proto udp tproxy to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept"
-		fi
-
-		local dns_hijack_chain=""
-		if [ -n "$dns_port" ]; then
-			dns_hijack_chain="
-	chain dstnat {
-		type nat hook prerouting priority dstnat - 1; policy accept;
-		iifname { ${nft_ifaces} } meta l4proto { tcp, udp } th dport 53 redirect to :${dns_port}
-	}"
-		fi
-
-		nft -f - <<EOF
+		# 2. 生成 nftables 规则文件 /tmp/mihomo.nft
+		cat <<NFT_EOF > "$NFT_FILE"
 table inet ${NFT_TABLE} {
 	set bypass_ipv4 {
 		type ipv4_addr
@@ -88,25 +94,76 @@ table inet ${NFT_TABLE} {
 		elements = {
 			0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
 			169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
-			224.0.0.0/4, 240.0.0.0/4${extra_ip_Elements}
+			224.0.0.0/4, 240.0.0.0/4$( [ -n "$bypass_ips" ] && echo ", $(to_nft_raw_set "$bypass_ips")" )
 		}
 	}
 
 	chain prerouting {
 		type filter hook prerouting priority mangle; policy accept;
 
+		# 仅处理 IPv4
+		meta nfproto != ipv4 return
+
+		# 防环路：放行 Mihomo 自身流量
 		meta skuid ${MIHOMO_UID} return
-		iifname != { ${nft_ifaces} } return
-		${mac_bypass_rule}
+		meta skgid ${MIHOMO_UID} return
+		meta mark ${ROUTING_MARK} return
+NFT_EOF
+
+		# 写入网口匹配逻辑
+		local nft_all_ifaces
+		nft_all_ifaces="$(to_nft_str_set "$proxy_ifaces")"
+		echo "		iifname != { ${nft_all_ifaces} } return" >> "$NFT_FILE"
+
+		# 绕过指定源 MAC
+		if [ -n "$bypass_src_macs" ]; then
+			echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" >> "$NFT_FILE"
+		fi
+
+		cat <<NFT_EOF >> "$NFT_FILE"
+
+		# 优先拦截 Fake-IP 网段 (198.18.0.0/15)，防止被其他规则放行
+		ip daddr 198.18.0.0/15 meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
+$( [ "$proxy_udp" != "0" ] && echo "		ip daddr 198.18.0.0/15 meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
+
+		# 绕过内网与自定义白名单 IP
 		ip daddr @bypass_ipv4 return
 
-		meta l4proto tcp tproxy to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
-		${udp_tproxy_rule}
+		# 拦截已建立的透明代理连接与新连接
+		meta l4proto tcp socket transparent 1 meta mark set ${FW_MARK} accept
+		meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
+$( [ "$proxy_udp" != "0" ] && echo "		meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 	}
-	${dns_hijack_chain}
-}
-EOF
-		logger -t mihomo "Applied nftables TProxy rules for interfaces: ${proxy_ifaces}"
+NFT_EOF
+
+		# DNS 劫持链
+		if [ -n "$dns_port" ]; then
+			cat <<NFT_EOF >> "$NFT_FILE"
+
+	chain dstnat {
+		type nat hook prerouting priority dstnat - 1; policy accept;
+		meta nfproto != ipv4 return
+		meta skuid ${MIHOMO_UID} return
+		meta mark ${ROUTING_MARK} return
+		iifname != { ${nft_all_ifaces} } return
+$( [ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" )
+		udp dport 53 redirect to :${dns_port}
+		tcp dport 53 redirect to :${dns_port}
+	}
+NFT_EOF
+		fi
+
+		echo "}" >> "$NFT_FILE"
+
+		# 3. 执行加载并记录具体错误
+		local err_msg
+		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
+		if [ $? -eq 0 ]; then
+			logger -t mihomo "Successfully applied nftables rules for: ${proxy_ifaces}"
+		else
+			logger -t mihomo "Failed to apply nftables: ${err_msg}"
+			echo "nftables error: ${err_msg}" >&2
+		fi
 	fi
 }
 
@@ -117,19 +174,16 @@ cleanup_firewall() {
 }
 
 start_service() {
-	config_load "mihomo"
-
 	local enabled config_path
-	config_get_bool enabled "config" "enabled" 0
-	[ "$enabled" -eq 0 ] && return 0
+	enabled="$(uci -q get mihomo.config.enabled)"
+	[ "$enabled" != "1" ] && return 0
 
-	config_get config_path "config" "config_path" "/etc/mihomo/config.yaml"
+	config_path="$(uci -q get mihomo.config.config_path)"
+	[ -z "$config_path" ] && config_path="/etc/mihomo/config.yaml"
+
 	if [ ! -f "$config_path" ]; then
-		logger -t mihomo "Config file $config_path not found, copying example..."
 		cp /etc/mihomo/example.yaml "$config_path" 2>/dev/null
 	fi
-
-	chown -R mihomo:mihomo "$CONF_DIR" 2>/dev/null
 
 	procd_open_instance "mihomo"
 	procd_set_param command "$PROG" -d "$CONF_DIR" -f "$config_path"
@@ -154,3 +208,5 @@ reload_service() {
 service_triggers() {
 	procd_add_reload_trigger "mihomo"
 }
+EOF
+chmod +x /etc/init.d/mihomo
