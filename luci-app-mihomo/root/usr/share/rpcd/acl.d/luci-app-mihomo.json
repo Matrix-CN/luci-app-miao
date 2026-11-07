@@ -1,0 +1,14 @@
+{
+	"luci-app-mihomo": {
+		"description": "Grant access to Mihomo configuration and service status",
+		"read": {
+			"uci": [ "mihomo" ],
+			"ubus": {
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "mihomo" ]
+		}
+	}
+}
