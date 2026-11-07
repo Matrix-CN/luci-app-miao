@@ -1,0 +1,82 @@
+name: Build OpenWrt 25.12 APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '目标设备架构 (Target-Subtarget)'
+        required: true
+        default: 'x86-64'
+        type: choice
+        options:
+          - 'x86-64'
+          - 'armsr-armv8'
+          - 'mediatek-filogic'
+          - 'rockchip-armv8'
+          - 'qualcommax-ipq807x'
+      openwrt_branch:
+        description: 'OpenWrt SDK 版本分支'
+        required: true
+        default: '25.12'
+        type: choice
+        options:
+          - '25.12'
+          - 'SNAPSHOT'
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build_openwrt_apk:
+    runs-on: ubuntu-latest
+    # 直接使用 OpenWrt 官方 SDK 容器，免去下载解压耗时
+    container:
+      image: ghcr.io/openwrt/sdk:${{ github.event.inputs.arch || 'x86-64' }}-${{ github.event.inputs.openwrt_branch || '25.12-SNAPSHOT' }}
+      options: --user root
+
+    steps:
+      - name: 1. 检出源码到 SDK 的 package/miao 目录
+        uses: actions/checkout@v4
+        with:
+          path: package/miao
+
+      - name: 2. 更新 Feeds 基础依赖 (luci / packages / golang)
+        run: |
+          # 修正容器内目录权限
+          chown -R buildbot:buildbot /builder
+          
+          # 如果插件依赖 LuCI 或 Go 环境，拉取基础 feeds
+          ./scripts/feeds update packages luci
+          ./scripts/feeds install -a -p luci
+          ./scripts/feeds install golang
+
+      - name: 3. 生成默认配置并开启 APK 包管理器支持
+        run: |
+          make defconfig
+          # 确保启用 OpenWrt 25.12 的 apk 包格式 (CONFIG_USE_APK)
+          sed -i 's/# CONFIG_USE_APK is not set/CONFIG_USE_APK=y/g' .config
+          grep -q "CONFIG_USE_APK=y" .config || echo "CONFIG_USE_APK=y" >> .config
+          make defconfig
+
+      - name: 4. 自动识别包名并编译生成 .apk
+        run: |
+          echo "正在扫描 package/miao 下的 Makefile..."
+          # 查找所有包含 BuildPackage 或 LuCI 的 Makefile 并逐一编译
+          find package/miao -name "Makefile" | while read makefile; do
+            pkg_dir=$(dirname "$makefile")
+            echo ">>> 开始编译目录: $pkg_dir"
+            make "$pkg_dir/compile" V=s -j$(nproc)
+          done
+
+      - name: 5. 整理生成的 .apk 软件包
+        run: |
+          mkdir -p /builder/output_apks
+          # 查找编译产出的所有 .apk 包（排除索引文件 packages.adb）
+          find bin/packages/ -type f -name "*.apk" -exec cp {} /builder/output_apks/ \;
+          ls -lh /builder/output_apks/
+
+      - name: 6. 上传 OpenWrt APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-25.12-${{ github.event.inputs.arch || 'x86-64' }}-apks
+          path: /builder/output_apks/*.apk
+          if-no-files-found: error
