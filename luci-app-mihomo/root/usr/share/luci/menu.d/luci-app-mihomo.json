@@ -1,0 +1,14 @@
+{
+	"admin/services/mihomo": {
+		"title": "Mihomo 透明代理",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "mihomo/config"
+		},
+		"depends": {
+			"acl": [ "luci-app-mihomo" ],
+			"uci": { "mihomo": true }
+		}
+	}
+}
