@@ -28,53 +28,67 @@ on:
 jobs:
   build_openwrt_apk:
     runs-on: ubuntu-latest
-    # 直接使用 OpenWrt 官方 SDK 容器，免去下载解压耗时
     container:
       image: ghcr.io/openwrt/sdk:${{ github.event.inputs.arch || 'x86-64' }}-${{ github.event.inputs.openwrt_branch || '25.12-SNAPSHOT' }}
       options: --user root
+    env:
+      # 允许在容器内以 root 权限执行 configure 和 make
+      FORCE_UNSAFE_CONFIGURE: 1
 
     steps:
-      - name: 1. 检出源码到 SDK 的 package/miao 目录
+      - name: 1. 检出源码到默认工作区
         uses: actions/checkout@v4
-        with:
-          path: package/miao
 
-      - name: 2. 更新 Feeds 基础依赖 (luci / packages / golang)
+      - name: 2. 将源码拷贝至 SDK 的 /builder/package/miao
         run: |
-          # 修正容器内目录权限
-          chown -R buildbot:buildbot /builder
+          mkdir -p /builder/package/miao
+          cp -rf "$GITHUB_WORKSPACE"/* /builder/package/miao/
+          ls -la /builder/package/miao/
+
+      - name: 3. 更新 Feeds 基础依赖 (在 /builder 目录下执行)
+        working-directory: /builder
+        run: |
+          # 确保 git 信任容器内的目录
+          git config --global --add safe.directory '*'
           
-          # 如果插件依赖 LuCI 或 Go 环境，拉取基础 feeds
-          ./scripts/feeds update packages luci
+          # 拉取基础 feeds (base / packages / luci)
+          ./scripts/feeds update base packages luci
           ./scripts/feeds install -a -p luci
           ./scripts/feeds install golang
 
-      - name: 3. 生成默认配置并开启 APK 包管理器支持
+      - name: 4. 生成默认配置并开启 APK 包管理器支持
+        working-directory: /builder
         run: |
           make defconfig
           # 确保启用 OpenWrt 25.12 的 apk 包格式 (CONFIG_USE_APK)
           sed -i 's/# CONFIG_USE_APK is not set/CONFIG_USE_APK=y/g' .config
           grep -q "CONFIG_USE_APK=y" .config || echo "CONFIG_USE_APK=y" >> .config
+          # 关闭安装包签名校验（或让 SDK 生成本地测试密钥），避免打包时报错
+          sed -i 's/CONFIG_SIGNED_PACKAGES=y/# CONFIG_SIGNED_PACKAGES is not set/g' .config
           make defconfig
 
-      - name: 4. 自动识别包名并编译生成 .apk
+      - name: 5. 自动识别 Makefile 并编译生成 .apk
+        working-directory: /builder
         run: |
-          echo "正在扫描 package/miao 下的 Makefile..."
-          # 查找所有包含 BuildPackage 或 LuCI 的 Makefile 并逐一编译
-          find package/miao -name "Makefile" | while read makefile; do
+          echo "正在扫描 /builder/package/miao 下的 Makefile..."
+          find package/miao -name "Makefile" | sort | while read makefile; do
             pkg_dir=$(dirname "$makefile")
+            echo "=========================================="
             echo ">>> 开始编译目录: $pkg_dir"
+            echo "=========================================="
             make "$pkg_dir/compile" V=s -j$(nproc)
           done
 
-      - name: 5. 整理生成的 .apk 软件包
+      - name: 6. 整理生成的 .apk 软件包
+        working-directory: /builder
         run: |
           mkdir -p /builder/output_apks
-          # 查找编译产出的所有 .apk 包（排除索引文件 packages.adb）
-          find bin/packages/ -type f -name "*.apk" -exec cp {} /builder/output_apks/ \;
+          # 查找编译产出的所有 .apk 包（仅提取我们编译的 miao 相关包或全部产出）
+          find bin/packages/ -type f -name "*.apk" -exec cp -v {} /builder/output_apks/ \;
+          echo ">>> 最终打包产出的 .apk 列表："
           ls -lh /builder/output_apks/
 
-      - name: 6. 上传 OpenWrt APK 产物
+      - name: 7. 上传 OpenWrt APK 产物
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-25.12-${{ github.event.inputs.arch || 'x86-64' }}-apks
