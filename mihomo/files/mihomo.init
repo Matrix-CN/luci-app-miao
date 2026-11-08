@@ -34,11 +34,21 @@ to_nft_raw_set() {
 	echo "$res"
 }
 
+# 判断空格分隔的列表中是否包含指定元素
+list_contains() {
+	local list="$1"
+	local target="$2"
+	local item
+	for item in $list; do
+		[ "$item" = "$target" ] && return 0
+	done
+	return 1
+}
+
 # 从 config.yaml 中自动提取 dns.listen 端口
 get_yaml_dns_port() {
 	local conf="$1"
 	[ ! -f "$conf" ] && return
-	# 提取 dns: 块下的 listen: 端口（例如 0.0.0.0:1053 或 :1053）
 	awk '
 		/^dns:/ { in_dns=1; next }
 		in_dns && /^[^ \t#]/ { in_dns=0 }
@@ -54,7 +64,7 @@ get_yaml_dns_port() {
 setup_firewall() {
 	cleanup_firewall
 
-	local enabled proxy_mode proxy_ifaces proxy_udp tproxy_port dns_port bypass_ips bypass_src_macs config_path
+	local enabled proxy_mode proxy_ifaces proxy_udp tproxy_port uci_dns_port yaml_dns_port dns_port bypass_ips bypass_src_macs config_path
 	enabled="$(uci -q get mihomo.config.enabled)"
 	[ "$enabled" != "1" ] && return 0
 
@@ -75,9 +85,13 @@ setup_firewall() {
 	tproxy_port="$(uci -q get mihomo.config.tproxy_port)"
 	[ -z "$tproxy_port" ] && tproxy_port="7893"
 
-	# 优先从 config.yaml 自动读取 dns.listen 端口，若无则回退读取 uci
-	dns_port="$(get_yaml_dns_port "$config_path")"
-	[ -z "$dns_port" ] && dns_port="$(uci -q get mihomo.config.dns_port)"
+	# 优先判断 UCI 中的 dns_port：留空代表不劫持；非空时优先同步 config.yaml 中的 dns.listen 端口
+	uci_dns_port="$(uci -q get mihomo.config.dns_port)"
+	dns_port=""
+	if [ -n "$uci_dns_port" ]; then
+		yaml_dns_port="$(get_yaml_dns_port "$config_path")"
+		dns_port="${yaml_dns_port:-$uci_dns_port}"
+	fi
 
 	bypass_ips="$(uci -q get mihomo.config.bypass_ips)"
 	bypass_src_macs="$(uci -q get mihomo.config.bypass_src_macs)"
@@ -89,15 +103,23 @@ setup_firewall() {
 	# 区分三层接口(如 br-lan)与桥接物理子网口(如 br-lan 下的 eth1)
 	local l3_ifaces=""
 	local br_ports=""
-	local iface
+	local iface master_br
 	for iface in $proxy_ifaces; do
 		if [ -d "/sys/class/net/${iface}/brport" ]; then
-			br_ports="${br_ports} ${iface}"
-			modprobe br_netfilter 2>/dev/null
-			sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1
-			sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null 2>&1
+			modprobe nft_meta_bridge 2>/dev/null
+			if [ -d "/sys/module/nft_meta_bridge" ]; then
+				br_ports="${br_ports} ${iface}"
+			else
+				master_br="$(basename "$(readlink "/sys/class/net/${iface}/brport/bridge" 2>/dev/null)" 2>/dev/null)"
+				if [ -n "$master_br" ]; then
+					logger -t mihomo "Warning: kmod-nft-bridge not installed for bridge port ${iface}, falling back to ${master_br}"
+					list_contains "$l3_ifaces" "$master_br" || l3_ifaces="${l3_ifaces} ${master_br}"
+				else
+					l3_ifaces="${l3_ifaces} ${iface}"
+				fi
+			fi
 		else
-			l3_ifaces="${l3_ifaces} ${iface}"
+			list_contains "$l3_ifaces" "$iface" || l3_ifaces="${l3_ifaces} ${iface}"
 		fi
 	done
 
@@ -107,6 +129,9 @@ setup_firewall() {
 		ip route flush table "$RT_TABLE" 2>/dev/null
 		ip rule add fwmark "$FW_MARK" table "$RT_TABLE" priority 100
 		ip route add local 0.0.0.0/0 dev lo table "$RT_TABLE"
+
+		local l4_protos="tcp"
+		[ "$proxy_udp" != "0" ] && l4_protos="{ tcp, udp }"
 
 		# 2. 生成 nftables 规则文件 /tmp/mihomo.nft
 		cat <<NFT_EOF > "$NFT_FILE"
@@ -121,6 +146,12 @@ table inet ${NFT_TABLE} {
 		}
 	}
 
+	chain filter_iface {
+$( [ -n "$l3_ifaces" ] && echo "		iifname { $(to_nft_str_set "$l3_ifaces") } return" )
+$( [ -n "$br_ports" ] && echo "		meta ibrname { $(to_nft_str_set "$br_ports") } return" )
+		accept
+	}
+
 	chain prerouting {
 		type filter hook prerouting priority mangle; policy accept;
 
@@ -131,20 +162,17 @@ table inet ${NFT_TABLE} {
 		meta skuid ${MIHOMO_UID} return
 		meta skgid ${MIHOMO_UID} return
 		meta mark ${ROUTING_MARK} return
-NFT_EOF
 
-		# 写入网口匹配逻辑
-		local nft_all_ifaces
-		nft_all_ifaces="$(to_nft_str_set "$proxy_ifaces")"
-		echo "		iifname != { ${nft_all_ifaces} } return" >> "$NFT_FILE"
+		# 匹配所选三层接口或二层桥接子网口（未命中则直接 accept 放行）
+		jump filter_iface
+NFT_EOF
 
 		# 绕过指定源 MAC
 		if [ -n "$bypass_src_macs" ]; then
 			echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" >> "$NFT_FILE"
 		fi
 
-		# 关键修复：如果开启了 DNS 劫持，在 mangle 表中放行 53 和 dns_port 端口！
-		# 让 53 端口顺利进入后面的 dstnat 链进行 redirect，避免被 TProxy 拦截导致 192.168.2.1:1053 刷屏
+		# 若开启了 DNS 劫持，在 mangle 表中放行 53 和 dns_port 端口，交由后面 dstnat 链 redirect
 		if [ -n "$dns_port" ]; then
 			cat <<NFT_EOF >> "$NFT_FILE"
 		udp dport { 53, ${dns_port} } return
@@ -154,21 +182,22 @@ NFT_EOF
 
 		cat <<NFT_EOF >> "$NFT_FILE"
 
-		# 优先拦截 Fake-IP 网段 (198.18.0.0/15)，防止被其他规则放行
+		# 优先拦截 Fake-IP 网段 (198.18.0.0/15)
 		ip daddr 198.18.0.0/15 meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
 $( [ "$proxy_udp" != "0" ] && echo "		ip daddr 198.18.0.0/15 meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 
-		# 绕过内网与自定义白名单 IP
+		# 绕过路由器本机地址、内网与自定义白名单 IP
+		fib daddr type local return
 		ip daddr @bypass_ipv4 return
 
 		# 拦截已建立的透明代理连接与新连接
-		meta l4proto tcp socket transparent 1 meta mark set ${FW_MARK} accept
+		meta l4proto ${l4_protos} socket transparent 1 meta mark set ${FW_MARK} accept
 		meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
 $( [ "$proxy_udp" != "0" ] && echo "		meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 	}
 NFT_EOF
 
-		# DNS 劫持链：将所有 53 端口请求重定向到 Mihomo config.yaml 的 dns.listen 端口
+		# DNS 劫持链：将所选网口的 53 端口请求重定向到 Mihomo 的 dns.listen 端口
 		if [ -n "$dns_port" ]; then
 			cat <<NFT_EOF >> "$NFT_FILE"
 
@@ -178,7 +207,7 @@ NFT_EOF
 		meta skuid ${MIHOMO_UID} return
 		meta skgid ${MIHOMO_UID} return
 		meta mark ${ROUTING_MARK} return
-		iifname != { ${nft_all_ifaces} } return
+		jump filter_iface
 $( [ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" )
 		udp dport 53 redirect to :${dns_port}
 		tcp dport 53 redirect to :${dns_port}
@@ -192,10 +221,11 @@ NFT_EOF
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
-			logger -t mihomo "Successfully applied nftables rules for: ${proxy_ifaces} (DNS port: ${dns_port:-none})"
+			logger -t mihomo "Successfully applied nftables rules for: ${proxy_ifaces} (DNS port: ${dns_port:-disabled})"
 		else
 			logger -t mihomo "Failed to apply nftables: ${err_msg}"
 			echo "nftables error: ${err_msg}" >&2
+			return 1
 		fi
 	fi
 }
@@ -207,15 +237,32 @@ cleanup_firewall() {
 }
 
 start_service() {
-	local enabled config_path
+	local enabled config_path test_err
 	enabled="$(uci -q get mihomo.config.enabled)"
 	[ "$enabled" != "1" ] && return 0
+
+	if [ ! -x "$PROG" ]; then
+		logger -t mihomo "Error: Core binary $PROG not found or not executable"
+		return 1
+	fi
 
 	config_path="$(uci -q get mihomo.config.config_path)"
 	[ -z "$config_path" ] && config_path="/etc/mihomo/config.yaml"
 
-	if [ ! -f "$config_path" ]; then
+	if [ ! -f "$config_path" ] && [ -f "/etc/mihomo/example.yaml" ]; then
 		cp /etc/mihomo/example.yaml "$config_path" 2>/dev/null
+	fi
+
+	if [ ! -f "$config_path" ]; then
+		logger -t mihomo "Error: Configuration file $config_path does not exist"
+		return 1
+	fi
+
+	# 启动前校验配置文件合法性，避免配置错误但注入了 nftables 导致局域网断网
+	test_err="$("$PROG" -t -d "$CONF_DIR" -f "$config_path" 2>&1)"
+	if [ $? -ne 0 ]; then
+		logger -t mihomo "Error: Configuration test failed for $config_path: $test_err"
+		return 1
 	fi
 
 	procd_open_instance "mihomo"
@@ -239,5 +286,5 @@ reload_service() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger "mihomo"
+	procd_add_reload_trigger "mihomo" "network" "firewall"
 }
