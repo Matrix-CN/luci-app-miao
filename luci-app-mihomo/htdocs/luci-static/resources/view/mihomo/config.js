@@ -92,6 +92,58 @@ return view.extend({
 		o.value('core_only', _('仅启动核心 (不注入防火墙规则，仅作 Socks/HTTP 代理)'));
 		o.default = 'tproxy';
 
+		// ==================== 定时重启设置 ====================
+		o = s.taboption('basic', form.Flag, 'auto_restart', _('启用定时重启'),
+			_('通过系统 Crontab 定期重启 Mihomo 服务，释放内存或刷新连接状态。'));
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.ListValue, 'restart_type', _('定时重启方式'));
+		o.value('daily', _('每天定时重启'));
+		o.value('interval', _('按小时间隔重启'));
+		o.value('cron', _('自定义 Cron 表达式'));
+		o.default = 'daily';
+		o.depends('auto_restart', '1');
+
+		o = s.taboption('basic', form.ListValue, 'restart_hour', _('重启时间 (小时)'));
+		for (var h = 0; h < 24; h++) {
+			o.value(String(h), String.format('%02d 时', h));
+		}
+		o.default = '4';
+		o.depends({ auto_restart: '1', restart_type: 'daily' });
+
+		o = s.taboption('basic', form.Value, 'restart_min', _('重启时间 (分钟)'));
+		o.datatype = 'range(0,59)';
+		o.default = '0';
+		o.placeholder = '0';
+		o.depends({ auto_restart: '1', restart_type: 'daily' });
+
+		o = s.taboption('basic', form.ListValue, 'restart_interval', _('重启间隔周期'));
+		o.value('1', _('每 1 小时'));
+		o.value('2', _('每 2 小时'));
+		o.value('3', _('每 3 小时'));
+		o.value('4', _('每 4 小时'));
+		o.value('6', _('每 6 小时'));
+		o.value('8', _('每 8 小时'));
+		o.value('12', _('每 12 小时'));
+		o.default = '6';
+		o.depends({ auto_restart: '1', restart_type: 'interval' });
+
+		o = s.taboption('basic', form.Value, 'restart_cron', _('自定义 Cron 表达式'),
+			_('标准 5 段格式：<code>分 时 日 月 周</code>，例如每周一凌晨 3:30 重启填 <code>30 3 * * 1</code>'));
+		o.default = '0 4 * * *';
+		o.placeholder = '0 4 * * *';
+		o.depends({ auto_restart: '1', restart_type: 'cron' });
+		o.validate = function(section_id, value) {
+			if (!value) return _('Cron 表达式不能为空');
+			var parts = value.trim().split(/\s+/);
+			if (parts.length !== 5) {
+				return _('请输入合法的 5 段式 Cron 表达式（分 时 日 月 周）');
+			}
+			return true;
+		};
+
+		// ==================== 网口代理策略 ====================
 		o = s.taboption('interface', widgets.DeviceSelect, 'proxy_ifaces', _('代理指定网口 (二层/物理设备)'),
 			_('选择一个或多个需要透明代理的物理网口或网桥（例如：br-lan、eth1、eth2、phy0-ap0）。仅来自所选网口的流量会被重定向至 Mihomo。'));
 		o.multiple = true;
@@ -115,6 +167,7 @@ return view.extend({
 		o.datatype = 'macaddr';
 		o.placeholder = '00:11:22:33:44:55';
 
+		// ==================== 高级与端口 ====================
 		o = s.taboption('advanced', form.Value, 'tproxy_port', _('TProxy 监听端口'),
 			_('必须与 config.yaml 中的 tproxy-port 保持一致。'));
 		o.datatype = 'port';
