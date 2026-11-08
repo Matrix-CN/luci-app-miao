@@ -47,7 +47,6 @@ return view.extend({
 	render: function(data) {
 		var m, s, o;
 		var isRunning = data[1];
-		var uiPort = uci.get('mihomo', 'config', 'ui_port') || '9090';
 
 		m = new form.Map('mihomo', _('Mihomo 透明代理'),
 			_('基于 Mihomo 核心的规则分流与透明代理工具，支持指定物理网口/接口接管流量。'));
@@ -55,17 +54,22 @@ return view.extend({
 		s = m.section(form.TypedSection);
 		s.anonymous = true;
 		s.render = function () {
-			poll.add(function () {
-				return L.resolveDefault(getServiceStatus()).then(function (res) {
-					var view = document.getElementById('service_status');
-					if (view) view.innerHTML = renderStatus(res, uiPort);
-				});
-			});
+			var uiPort = uci.get('mihomo', 'config', 'ui_port') || '9090';
+			var statusEl = E('p', { id: 'service_status' });
+			statusEl.innerHTML = renderStatus(isRunning, uiPort);
 
 			return E('div', { class: 'cbi-section', id: 'status_bar' }, [
-				E('p', { id: 'service_status' }, _('正在获取状态...'))
+				statusEl
 			]);
 		};
+
+		poll.add(function () {
+			return L.resolveDefault(getServiceStatus()).then(function (res) {
+				var view = document.getElementById('service_status');
+				var currentPort = uci.get('mihomo', 'config', 'ui_port') || '9090';
+				if (view) view.innerHTML = renderStatus(res, currentPort);
+			});
+		});
 
 		s = m.section(form.NamedSection, 'config', 'mihomo', _('基本与网口代理设置'));
 		s.addremove = false;
@@ -120,7 +124,9 @@ return view.extend({
 		o = s.taboption('advanced', form.Value, 'dns_port', _('DNS 劫持端口'),
 			_('将指定网口的 53 端口 DNS 查询重定向至 Mihomo 的 dns.listen 端口（留空则不劫持）。'));
 		o.datatype = 'port';
+		o.placeholder = '1053';
 		o.default = '1053';
+		o.rmempty = true;
 
 		o = s.taboption('advanced', form.Value, 'ui_port', _('Web 面板端口'),
 			_('对应 config.yaml 中 external-controller 的端口，用于上方快捷跳转按钮。'));
