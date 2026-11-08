@@ -9,6 +9,8 @@ PROG="/usr/libexec/mihomo-core"
 CONF_DIR="/etc/mihomo"
 NFT_TABLE="mihomo"
 NFT_FILE="/tmp/mihomo.nft"
+CRON_FILE="/etc/crontabs/root"
+CRON_TAG="# mihomo_auto_restart"
 FW_MARK="0x162"
 ROUTING_MARK="666"
 RT_TABLE="162"
@@ -59,6 +61,60 @@ get_yaml_dns_port() {
 			exit
 		}
 	' "$conf"
+}
+
+cleanup_cron() {
+	[ ! -f "$CRON_FILE" ] && return 0
+	if grep -q "$CRON_TAG" "$CRON_FILE" 2>/dev/null; then
+		sed -i "/${CRON_TAG}/d" "$CRON_FILE"
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+}
+
+setup_cron() {
+	local enabled auto_restart restart_type restart_hour restart_min restart_interval restart_cron cron_expr
+	enabled="$(uci -q get mihomo.config.enabled)"
+	auto_restart="$(uci -q get mihomo.config.auto_restart)"
+
+	# 先清理旧任务，若未启用则直接退出
+	[ -f "$CRON_FILE" ] && sed -i "/${CRON_TAG}/d" "$CRON_FILE"
+	if [ "$enabled" != "1" ] || [ "$auto_restart" != "1" ]; then
+		/etc/init.d/cron restart >/dev/null 2>&1
+		return 0
+	fi
+
+	restart_type="$(uci -q get mihomo.config.restart_type)"
+	[ -z "$restart_type" ] && restart_type="daily"
+
+	case "$restart_type" in
+		daily)
+			restart_hour="$(uci -q get mihomo.config.restart_hour)"
+			restart_min="$(uci -q get mihomo.config.restart_min)"
+			[ -z "$restart_hour" ] && restart_hour="4"
+			[ -z "$restart_min" ] && restart_min="0"
+			cron_expr="${restart_min} ${restart_hour} * * *"
+			;;
+		interval)
+			restart_interval="$(uci -q get mihomo.config.restart_interval)"
+			[ -z "$restart_interval" ] && restart_interval="6"
+			cron_expr="0 */${restart_interval} * * *"
+			;;
+		cron)
+			restart_cron="$(uci -q get mihomo.config.restart_cron)"
+			[ -z "$restart_cron" ] && restart_cron="0 4 * * *"
+			cron_expr="$restart_cron"
+			;;
+		*)
+			return 0
+			;;
+	esac
+
+	mkdir -p /etc/crontabs
+	touch "$CRON_FILE"
+	echo "${cron_expr} /etc/init.d/mihomo restart >/dev/null 2>&1 ${CRON_TAG}" >> "$CRON_FILE"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+	logger -t mihomo "Scheduled restart enabled: (${cron_expr})"
 }
 
 setup_firewall() {
@@ -239,7 +295,10 @@ cleanup_firewall() {
 start_service() {
 	local enabled config_path test_err
 	enabled="$(uci -q get mihomo.config.enabled)"
-	[ "$enabled" != "1" ] && return 0
+	if [ "$enabled" != "1" ]; then
+		cleanup_cron
+		return 0
+	fi
 
 	if [ ! -x "$PROG" ]; then
 		logger -t mihomo "Error: Core binary $PROG not found or not executable"
@@ -274,10 +333,12 @@ start_service() {
 	procd_close_instance
 
 	setup_firewall
+	setup_cron
 }
 
 stop_service() {
 	cleanup_firewall
+	cleanup_cron
 }
 
 reload_service() {
