@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mihomo
 PKG_VERSION:=1.19.33
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/MetaCubeX/mihomo/tar.gz/v$(PKG_VERSION)?
@@ -36,7 +36,7 @@ define Package/mihomo
   SUBMENU:=Web Servers/Proxies
   TITLE:=A rule-based tunnel in Go
   URL:=https://github.com/MetaCubeX/mihomo
-  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle +kmod-tun +kmod-inet-diag +kmod-netlink-diag +kmod-nft-tproxy +kmod-nft-socket +ip-full
+  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle +kmod-tun +kmod-inet-diag +kmod-netlink-diag +kmod-nft-tproxy +kmod-nft-socket +kmod-nft-bridge +ip-full
   PROVIDES:=mihomo
   ALTERNATIVES:=\
     100:/usr/bin/mihomo:/usr/libexec/mihomo-core
@@ -55,7 +55,7 @@ define Package/mihomo/description
 endef
 
 define Package/mihomo/conffiles
-/etc/mihomo/config.yaml
+/etc/mihomo/
 /etc/config/mihomo
 endef
 
