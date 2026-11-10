@@ -13,8 +13,9 @@ FW_MARK="0x162"
 ROUTING_MARK="666"
 RT_TABLE="162"
 MIHOMO_UID="7890"
+CRON_FILE="/etc/crontabs/root"
 
-# 将空格分隔的列表转为 nftables 带引号集合: "br-lan", "eth1"
+# 转换为 nftables 字符串集合格式: "br-lan", "eth1"
 to_nft_str_set() {
 	local item res=""
 	for item in $1; do
@@ -24,7 +25,7 @@ to_nft_str_set() {
 	echo "$res"
 }
 
-# 将空格分隔的列表转为 nftables 原始集合: 192.168.100.0/24, 10.0.0.1
+# 转换为 nftables 原始集合格式: 192.168.100.0/24, 10.0.0.1
 to_nft_raw_set() {
 	local item res=""
 	for item in $1; do
@@ -34,11 +35,11 @@ to_nft_raw_set() {
 	echo "$res"
 }
 
-# 从 config.yaml 中自动提取 dns.listen 端口
+# 从 config.yaml 中提取 dns.listen 端口
 get_yaml_dns_port() {
 	local conf="$1"
 	[ ! -f "$conf" ] && return
-	# 提取 dns: 块下的 listen: 端口（例如 0.0.0.0:1053 或 :1053）
+	# 匹配 dns: 块下的 listen: 0.0.0.0:1053 或 :1053
 	awk '
 		/^dns:/ { in_dns=1; next }
 		in_dns && /^[^ \t#]/ { in_dns=0 }
@@ -49,6 +50,39 @@ get_yaml_dns_port() {
 			exit
 		}
 	' "$conf"
+}
+
+# 设置定时重启任务
+setup_cron() {
+	cleanup_cron
+
+	local enabled cron_restart cron_hour cron_minute cron_weekday
+	enabled="$(uci -q get mihomo.config.enabled)"
+	cron_restart="$(uci -q get mihomo.config.cron_restart)"
+
+	[ "$enabled" != "1" ] || [ "$cron_restart" != "1" ] && return 0
+
+	cron_hour="$(uci -q get mihomo.config.cron_hour)"
+	cron_minute="$(uci -q get mihomo.config.cron_minute)"
+	cron_weekday="$(uci -q get mihomo.config.cron_weekday)"
+
+	[ -z "$cron_hour" ] && cron_hour="4"
+	[ -z "$cron_minute" ] && cron_minute="0"
+	[ -z "$cron_weekday" ] && cron_weekday="*"
+
+	mkdir -p /etc/crontabs
+	touch "$CRON_FILE"
+	echo "${cron_minute} ${cron_hour} * * ${cron_weekday} /etc/init.d/mihomo restart # mihomo_cron" >> "$CRON_FILE"
+	/etc/init.d/cron reload >/dev/null 2>&1 || /etc/init.d/cron restart >/dev/null 2>&1
+	logger -t mihomo "Scheduled restart enabled: ${cron_minute} ${cron_hour} * * ${cron_weekday}"
+}
+
+# 清理定时重启任务
+cleanup_cron() {
+	if [ -f "$CRON_FILE" ] && grep -q "# mihomo_cron" "$CRON_FILE"; then
+		sed -i '/# mihomo_cron/d' "$CRON_FILE"
+		/etc/init.d/cron reload >/dev/null 2>&1 || /etc/init.d/cron restart >/dev/null 2>&1
+	fi
 }
 
 setup_firewall() {
@@ -75,18 +109,17 @@ setup_firewall() {
 	tproxy_port="$(uci -q get mihomo.config.tproxy_port)"
 	[ -z "$tproxy_port" ] && tproxy_port="7893"
 
-	# 优先从 config.yaml 自动读取 dns.listen 端口，若无则回退读取 uci
+	# 优先读取 config.yaml 中的 dns.listen 端口，否则回退读取 uci
 	dns_port="$(get_yaml_dns_port "$config_path")"
 	[ -z "$dns_port" ] && dns_port="$(uci -q get mihomo.config.dns_port)"
 
 	bypass_ips="$(uci -q get mihomo.config.bypass_ips)"
 	bypass_src_macs="$(uci -q get mihomo.config.bypass_src_macs)"
 
-	# 自动加载必要内核模块
 	modprobe nft_tproxy 2>/dev/null
 	modprobe nft_socket 2>/dev/null
 
-	# 区分三层接口(如 br-lan)与桥接物理子网口(如 br-lan 下的 eth1)
+	# 区分三层接口 (如 br-lan) 与桥接子接口 (如 br-lan 下的 eth1)
 	local l3_ifaces=""
 	local br_ports=""
 	local iface
@@ -115,9 +148,15 @@ table inet ${NFT_TABLE} {
 		type ipv4_addr
 		flags interval
 		elements = {
-			0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
-			169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
-			224.0.0.0/4, 240.0.0.0/4$( [ -n "$bypass_ips" ] && echo ", $(to_nft_raw_set "$bypass_ips")" )
+			0.0.0.0/8,
+			10.0.0.0/8,
+			100.64.0.0/10,
+			127.0.0.0/8,
+			169.254.0.0/16,
+			172.16.0.0/12,
+			192.168.0.0/16,
+			224.0.0.0/4,
+			240.0.0.0/4$( [ -n "$bypass_ips" ] && echo ", $(to_nft_raw_set "$bypass_ips")" )
 		}
 	}
 
@@ -127,13 +166,12 @@ table inet ${NFT_TABLE} {
 		# 仅处理 IPv4
 		meta nfproto != ipv4 return
 
-		# 防环路：放行 Mihomo 自身流量
+		# 绕过 Mihomo 自身流量及标记流量
 		meta skuid ${MIHOMO_UID} return
 		meta skgid ${MIHOMO_UID} return
 		meta mark ${ROUTING_MARK} return
 NFT_EOF
 
-		# 写入网口匹配逻辑
 		local nft_all_ifaces
 		nft_all_ifaces="$(to_nft_str_set "$proxy_ifaces")"
 		echo "		iifname != { ${nft_all_ifaces} } return" >> "$NFT_FILE"
@@ -143,8 +181,7 @@ NFT_EOF
 			echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" >> "$NFT_FILE"
 		fi
 
-		# 关键修复：如果开启了 DNS 劫持，在 mangle 表中放行 53 和 dns_port 端口！
-		# 让 53 端口顺利进入后面的 dstnat 链进行 redirect，避免被 TProxy 拦截导致 192.168.2.1:1053 刷屏
+		# DNS 流量在 mangle 链放行（53 端口和 dns_port），交由 dstnat 链 redirect，避免 TProxy 劫持导致部分网关 DNS 异常
 		if [ -n "$dns_port" ]; then
 			cat <<NFT_EOF >> "$NFT_FILE"
 		udp dport { 53, ${dns_port} } return
@@ -153,25 +190,21 @@ NFT_EOF
 		fi
 
 		cat <<NFT_EOF >> "$NFT_FILE"
-
-		# 优先拦截 Fake-IP 网段 (198.18.0.0/15)，防止被其他规则放行
+		# Fake-IP 网段优先代理 (198.18.0.0/15)
 		ip daddr 198.18.0.0/15 meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
 $( [ "$proxy_udp" != "0" ] && echo "		ip daddr 198.18.0.0/15 meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 
-		# 绕过内网与自定义白名单 IP
 		ip daddr @bypass_ipv4 return
 
-		# 拦截已建立的透明代理连接与新连接
 		meta l4proto tcp socket transparent 1 meta mark set ${FW_MARK} accept
 		meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
 $( [ "$proxy_udp" != "0" ] && echo "		meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 	}
 NFT_EOF
 
-		# DNS 劫持链：将所有 53 端口请求重定向到 Mihomo config.yaml 的 dns.listen 端口
+		# DNS 劫持：将 53 端口重定向到 Mihomo config.yaml 中的 dns.listen 端口
 		if [ -n "$dns_port" ]; then
 			cat <<NFT_EOF >> "$NFT_FILE"
-
 	chain dstnat {
 		type nat hook prerouting priority dstnat - 1; policy accept;
 		meta nfproto != ipv4 return
@@ -188,7 +221,7 @@ NFT_EOF
 
 		echo "}" >> "$NFT_FILE"
 
-		# 3. 执行加载并记录具体错误
+		# 3. 加载规则
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
@@ -209,7 +242,10 @@ cleanup_firewall() {
 start_service() {
 	local enabled config_path
 	enabled="$(uci -q get mihomo.config.enabled)"
-	[ "$enabled" != "1" ] && return 0
+	if [ "$enabled" != "1" ]; then
+		cleanup_cron
+		return 0
+	fi
 
 	config_path="$(uci -q get mihomo.config.config_path)"
 	[ -z "$config_path" ] && config_path="/etc/mihomo/config.yaml"
@@ -227,10 +263,12 @@ start_service() {
 	procd_close_instance
 
 	setup_firewall
+	setup_cron
 }
 
 stop_service() {
 	cleanup_firewall
+	cleanup_cron
 }
 
 reload_service() {
