@@ -52,7 +52,6 @@ get_yaml_dns_port() {
 	' "$conf"
 }
 
-# 设置定时重启任务
 setup_cron() {
 	cleanup_cron
 
@@ -77,7 +76,6 @@ setup_cron() {
 	logger -t mihomo "Scheduled restart enabled: ${cron_minute} ${cron_hour} * * ${cron_weekday}"
 }
 
-# 清理定时重启任务
 cleanup_cron() {
 	if [ -f "$CRON_FILE" ] && grep -q "# mihomo_cron" "$CRON_FILE"; then
 		sed -i '/# mihomo_cron/d' "$CRON_FILE"
@@ -109,7 +107,7 @@ setup_firewall() {
 	tproxy_port="$(uci -q get mihomo.config.tproxy_port)"
 	[ -z "$tproxy_port" ] && tproxy_port="7893"
 
-	# 优先读取 config.yaml 中的 dns.listen 端口，否则回退读取 uci
+	# 优先读取 config.yaml 中的 dns.listen 端口，若无则回退到 uci
 	dns_port="$(get_yaml_dns_port "$config_path")"
 	[ -z "$dns_port" ] && dns_port="$(uci -q get mihomo.config.dns_port)"
 
@@ -119,7 +117,7 @@ setup_firewall() {
 	modprobe nft_tproxy 2>/dev/null
 	modprobe nft_socket 2>/dev/null
 
-	# 区分三层接口 (如 br-lan) 与桥接子接口 (如 br-lan 下的 eth1)
+	# 区分三层接口(如 br-lan) 与 桥接子物理接口(如属于 br-lan 的 eth1)
 	local l3_ifaces=""
 	local br_ports=""
 	local iface
@@ -141,7 +139,7 @@ setup_firewall() {
 		ip rule add fwmark "$FW_MARK" table "$RT_TABLE" priority 100
 		ip route add local 0.0.0.0/0 dev lo table "$RT_TABLE"
 
-		# 2. 生成 nftables 规则文件 /tmp/mihomo.nft
+		# 2. 生成 nftables 规则脚本到 /tmp/mihomo.nft
 		cat <<NFT_EOF > "$NFT_FILE"
 table inet ${NFT_TABLE} {
 	set bypass_ipv4 {
@@ -166,7 +164,7 @@ table inet ${NFT_TABLE} {
 		# 仅处理 IPv4
 		meta nfproto != ipv4 return
 
-		# 绕过 Mihomo 自身流量及标记流量
+		# 绕过 Mihomo 自身流量，防止回环
 		meta skuid ${MIHOMO_UID} return
 		meta skgid ${MIHOMO_UID} return
 		meta mark ${ROUTING_MARK} return
@@ -181,7 +179,13 @@ NFT_EOF
 			echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" >> "$NFT_FILE"
 		fi
 
-		# DNS 流量在 mangle 链放行（53 端口和 dns_port），交由 dstnat 链 redirect，避免 TProxy 劫持导致部分网关 DNS 异常
+		# 绕过指定目标 IP 或源 IP（优先级高于 DNS 和 Fake-IP，确保彻底绕过 Mihomo）
+		if [ -n "$bypass_ips" ]; then
+			echo "		ip daddr { $(to_nft_raw_set "$bypass_ips") } return" >> "$NFT_FILE"
+			echo "		ip saddr { $(to_nft_raw_set "$bypass_ips") } return" >> "$NFT_FILE"
+		fi
+
+		# DNS 流量在 mangle 链直接放行，交给后续 dstnat 链做端口 redirect（避免 TProxy 夺取 DNS 包）
 		if [ -n "$dns_port" ]; then
 			cat <<NFT_EOF >> "$NFT_FILE"
 		udp dport { 53, ${dns_port} } return
@@ -190,29 +194,37 @@ NFT_EOF
 		fi
 
 		cat <<NFT_EOF >> "$NFT_FILE"
-		# Fake-IP 网段优先代理 (198.18.0.0/15)
+		# Fake-IP 池流量强制透明代理 (198.18.0.0/15)
 		ip daddr 198.18.0.0/15 meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
 $( [ "$proxy_udp" != "0" ] && echo "		ip daddr 198.18.0.0/15 meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 
+		# 绕过保留地址与自定义目标 IP
 		ip daddr @bypass_ipv4 return
 
+		# 已建立透明套接字的连接直接打标记放行
 		meta l4proto tcp socket transparent 1 meta mark set ${FW_MARK} accept
+
+		# 其余流量重定向至 TProxy 端口
 		meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept
 $( [ "$proxy_udp" != "0" ] && echo "		meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept" )
 	}
 NFT_EOF
 
-		# DNS 劫持：将 53 端口重定向到 Mihomo config.yaml 中的 dns.listen 端口
+		# DNS 劫持链：将局域网 53 端口请求重定向到 Mihomo config.yaml 的 dns.listen 端口
 		if [ -n "$dns_port" ]; then
 			cat <<NFT_EOF >> "$NFT_FILE"
 	chain dstnat {
 		type nat hook prerouting priority dstnat - 1; policy accept;
+
 		meta nfproto != ipv4 return
 		meta skuid ${MIHOMO_UID} return
 		meta skgid ${MIHOMO_UID} return
 		meta mark ${ROUTING_MARK} return
 		iifname != { ${nft_all_ifaces} } return
 $( [ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return" )
+$( [ -n "$bypass_ips" ] && echo "		ip daddr { $(to_nft_raw_set "$bypass_ips") } return" )
+$( [ -n "$bypass_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$bypass_ips") } return" )
+
 		udp dport 53 redirect to :${dns_port}
 		tcp dport 53 redirect to :${dns_port}
 	}
@@ -221,7 +233,7 @@ NFT_EOF
 
 		echo "}" >> "$NFT_FILE"
 
-		# 3. 加载规则
+		# 3. 原子化加载规则并校验结果
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
