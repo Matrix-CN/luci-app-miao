@@ -28,7 +28,7 @@ function renderStatus(isRunning, port) {
 	var renderHTML;
 	if (isRunning) {
 		var button = String.format('&#160;<a class="btn cbi-button" href="http://%s:%s/ui" target="_blank" rel="noreferrer noopener">%s</a>',
-			window.location.hostname, port || '9090', _('打开面板'));
+			window.location.hostname, port || '9090', _('打开控制面板'));
 		renderHTML = String.format(spanTemp, 'green', _('Mihomo'), _('运行中')) + button;
 	} else {
 		renderHTML = String.format(spanTemp, 'red', _('Mihomo'), _('未运行'));
@@ -50,7 +50,7 @@ return view.extend({
 		var uiPort = uci.get('mihomo', 'config', 'ui_port') || '9090';
 
 		m = new form.Map('mihomo', _('Mihomo 透明代理'),
-			_('Mihomo 是一个基于规则的代理工具，支持多种协议与分流策略。'));
+			_('Mihomo 是一个基于规则的多平台代理客户端，支持按网络接口进行透明分流。'));
 
 		s = m.section(form.TypedSection);
 		s.anonymous = true;
@@ -67,10 +67,10 @@ return view.extend({
 			]);
 		};
 
-		s = m.section(form.NamedSection, 'config', 'mihomo', _('基本设置'));
+		s = m.section(form.NamedSection, 'config', 'mihomo', _('服务配置'));
 		s.addremove = false;
 
-		s.tab('basic', _('核心配置'));
+		s.tab('basic', _('基本设置'));
 		s.tab('interface', _('接口与分流'));
 		s.tab('advanced', _('端口设置'));
 		s.tab('cron', _('定时重启'));
@@ -79,18 +79,18 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'config_path', _('配置文件路径'),
-			_('指定位于 /etc/mihomo/ 下的 YAML 配置文件路径'));
+			_('指定 /etc/mihomo/ 下的 YAML 配置文件路径。'));
 		o.default = '/etc/mihomo/config.yaml';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.ListValue, 'proxy_mode', _('代理模式'));
 		o.value('tproxy', _('TProxy 透明代理 (nftables 推荐)'));
-		o.value('tun', _('TUN 模式 (由 Mihomo 接管)'));
+		o.value('tun', _('TUN 模式 (由 Mihomo 配置文件接管)'));
 		o.value('core_only', _('仅启动核心 (仅提供 Socks/HTTP 端口)'));
 		o.default = 'tproxy';
 
-		o = s.taboption('interface', widgets.DeviceSelect, 'proxy_ifaces', _('代理物理接口'),
-			_('选择需要透明代理的接口（如 br-lan, eth1, eth2, phy0-ap0 等），流量进入这些接口将被 Mihomo 接管'));
+		o = s.taboption('interface', widgets.DeviceSelect, 'proxy_ifaces', _('代理网络接口'),
+			_('选择需要经过 Mihomo 透明代理的局域网接口或物理网口（如 br-lan, eth1, eth2, phy0-ap0 等）。'));
 		o.multiple = true;
 		o.noaliases = true;
 		o.nobridges = false;
@@ -98,38 +98,38 @@ return view.extend({
 		o.default = 'br-lan';
 
 		o = s.taboption('interface', form.Flag, 'proxy_udp', _('代理 UDP 流量'),
-			_('开启后将转发 UDP 流量（如游戏、QUIC 等，仅 TProxy 模式有效）'));
+			_('启用后将透明代理局域网内的 UDP 流量（如 QUIC、游戏语音等，仅 TProxy 模式有效）。'));
 		o.default = '1';
 		o.depends('proxy_mode', 'tproxy');
 
-		o = s.taboption('interface', form.DynamicList, 'bypass_ips', _('绕过目标 IP'),
-			_('发往这些目标 IP 的流量不经过 Mihomo 处理'));
+		o = s.taboption('interface', form.DynamicList, 'bypass_src_ips', _('绕过源 IP 地址'),
+			_('来自这些客户端 IP 地址或网段的流量不经过 Mihomo 处理（局域网设备直连）。'));
 		o.datatype = 'or(ip4addr, cidr4)';
 		o.placeholder = '192.168.1.100';
 
 		o = s.taboption('interface', form.DynamicList, 'bypass_src_macs', _('绕过源 MAC 地址'),
-			_('来自这些客户端 MAC 地址的流量不经过 Mihomo 处理（局域网设备直连）'));
+			_('来自这些客户端 MAC 地址的流量不经过 Mihomo 处理（局域网设备直连）。'));
 		o.datatype = 'macaddr';
 		o.placeholder = '00:11:22:33:44:55';
 
 		o = s.taboption('advanced', form.Value, 'tproxy_port', _('TProxy 端口'),
-			_('需与 config.yaml 中的 tproxy-port 保持一致'));
+			_('需与 config.yaml 中的 tproxy-port 保持一致。'));
 		o.datatype = 'port';
 		o.default = '7893';
 		o.depends('proxy_mode', 'tproxy');
 
 		o = s.taboption('advanced', form.Value, 'dns_port', _('DNS 重定向端口'),
-			_('劫持局域网 53 端口 DNS 请求并转发至此端口（优先自动读取 Mihomo 配置中的 dns.listen 端口）'));
+			_('将局域网 53 端口的 DNS 请求重定向至 Mihomo 的 dns.listen 端口。'));
 		o.datatype = 'port';
 		o.default = '1053';
 
 		o = s.taboption('advanced', form.Value, 'ui_port', _('Web 面板端口'),
-			_('需与 config.yaml 中的 external-controller 端口一致'));
+			_('需与 config.yaml 中的 external-controller 端口一致，用于状态栏跳转。'));
 		o.datatype = 'port';
 		o.default = '9090';
 
 		o = s.taboption('cron', form.Flag, 'cron_restart', _('启用定时重启'),
-			_('定期自动重启 Mihomo 服务以释放内存或更新订阅'));
+			_('定期自动重启 Mihomo 服务以释放内存或更新订阅。'));
 		o.default = '0';
 		o.rmempty = false;
 
