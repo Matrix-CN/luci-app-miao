@@ -5,11 +5,12 @@
 			"uci": [ "mihomo" ],
 			"ubus": {
 				"service": [ "list" ],
-				"file": [ "list", "stat", "read" ]
+				"file": [ "list", "stat", "read", "exec" ]
 			},
 			"file": {
 				"/etc/mihomo/*": [ "read" ],
-				"/etc/mihomo": [ "list" ]
+				"/etc/mihomo": [ "list" ],
+				"/usr/libexec/mihomo-core": [ "exec" ]
 			}
 		},
 		"write": {
