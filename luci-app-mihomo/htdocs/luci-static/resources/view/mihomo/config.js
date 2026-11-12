@@ -5,6 +5,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require fs';
 'require tools.widgets as widgets';
 
 var callServiceList = rpc.declare({
@@ -24,15 +25,30 @@ function getServiceStatus() {
 	});
 }
 
-function renderStatus(isRunning, port) {
+function getCoreVersion() {
+	return L.resolveDefault(fs.exec('/usr/libexec/mihomo-core', ['-v']), {}).then(function (res) {
+		if (res && res.code === 0 && res.stdout) {
+			var firstLine = res.stdout.trim().split('\n')[0];
+			var match = firstLine.match(/v[0-9]+\.[0-9]+\.[0-9]+[-a-zA-Z0-9.]*/);
+			return match ? match[0] : firstLine;
+		}
+		return _('未知');
+	}).catch(function () {
+		return _('未安装或无权限');
+	});
+}
+
+function renderStatus(isRunning, port, version) {
 	var spanTemp = '<em><span style="color:%s"><strong>%s %s</strong></span></em>';
+	var versionHtml = String.format('<span style="margin-left: 16px; color: #555;"><strong>%s:</strong> %s</span>',
+		_('内核版本'), version || _('未知'));
 	var renderHTML;
 	if (isRunning) {
-		var button = String.format('&#160;<a class="btn cbi-button" href="http://%s:%s/ui" target="_blank" rel="noreferrer noopener">%s</a>',
+		var button = String.format('&#160;&#160;<a class="btn cbi-button" href="http://%s:%s/ui" target="_blank" rel="noreferrer noopener">%s</a>',
 			window.location.hostname, port || '9090', _('打开面板'));
-		renderHTML = String.format(spanTemp, 'green', _('Mihomo'), _('运行中')) + button;
+		renderHTML = String.format(spanTemp, 'green', _('Mihomo'), _('运行中')) + versionHtml + button;
 	} else {
-		renderHTML = String.format(spanTemp, 'red', _('Mihomo'), _('未运行'));
+		renderHTML = String.format(spanTemp, 'red', _('Mihomo'), _('未运行')) + versionHtml;
 	}
 	return renderHTML;
 }
@@ -41,13 +57,15 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			uci.load('mihomo'),
-			getServiceStatus()
+			getServiceStatus(),
+			getCoreVersion()
 		]);
 	},
 
 	render: function(data) {
 		var m, s, o;
 		var isRunning = data[1];
+		var coreVersion = data[2];
 		var uiPort = uci.get('mihomo', 'config', 'ui_port') || '9090';
 
 		m = new form.Map('mihomo', _('Mihomo'), _('Mihomo 透明代理配置管理'));
@@ -58,12 +76,12 @@ return view.extend({
 			poll.add(function () {
 				return L.resolveDefault(getServiceStatus()).then(function (res) {
 					var view = document.getElementById('service_status');
-					if (view) view.innerHTML = renderStatus(res, uiPort);
+					if (view) view.innerHTML = renderStatus(res, uiPort, coreVersion);
 				});
 			});
 
 			return E('div', { class: 'cbi-section', id: 'status_bar' }, [
-				E('p', { id: 'service_status' }, _('正在获取状态...'))
+				E('p', { id: 'service_status' }, renderStatus(isRunning, uiPort, coreVersion))
 			]);
 		};
 
@@ -83,7 +101,6 @@ return view.extend({
 		o.rmempty = false;
 		o.renderWidget = function(section_id, option_index, cfgvalue) {
 			var node = form.Value.prototype.renderWidget.apply(this, [section_id, option_index, cfgvalue]);
-			var self = this;
 
 			return E('div', { 'style': 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
 				node,
@@ -93,7 +110,6 @@ return view.extend({
 						var inputEl = node.querySelector('input') || node;
 						var currentPath = (inputEl && inputEl.value) ? inputEl.value.trim() : '/etc/mihomo/config.yaml';
 
-						// 限制上传目标在 /etc/mihomo/ 目录下，保证安全性与规范性
 						if (!currentPath.startsWith('/etc/mihomo/') || currentPath === '/etc/mihomo/') {
 							currentPath = '/etc/mihomo/config.yaml';
 						}
