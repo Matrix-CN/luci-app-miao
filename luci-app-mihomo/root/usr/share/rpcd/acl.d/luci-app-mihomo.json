@@ -4,11 +4,23 @@
 		"read": {
 			"uci": [ "mihomo" ],
 			"ubus": {
-				"service": [ "list" ]
+				"service": [ "list" ],
+				"file": [ "list", "stat", "read" ]
+			},
+			"file": {
+				"/etc/mihomo/*": [ "read" ],
+				"/etc/mihomo": [ "list" ]
 			}
 		},
 		"write": {
-			"uci": [ "mihomo" ]
+			"uci": [ "mihomo" ],
+			"cgi-io": [ "upload" ],
+			"ubus": {
+				"file": [ "write", "remove", "exec" ]
+			},
+			"file": {
+				"/etc/mihomo/*": [ "write" ]
+			}
 		}
 	}
 }
