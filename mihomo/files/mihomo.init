@@ -85,16 +85,42 @@ wait_for_tun_route() {
 	while [ $i -lt 30 ]; do
 		for d in $devs; do
 			if ip link show "$d" >/dev/null 2>&1; then
+				ip link set "$d" up 2>/dev/null
 				ip route replace default dev "$d" table "$rt_table" 2>/dev/null
-				logger -t mihomo "Added UDP policy route to TUN device: ${d} (table ${rt_table})"
+				sysctl -w "net.ipv4.conf.${d}.rp_filter=0" >/dev/null 2>&1
+
+				# 在 fw4 的 forward 链最前面放行 TUN 网卡流量，防止被 fw4 默认的 zone 策略 reject
+				if nft list chain inet fw4 forward >/dev/null 2>&1; then
+					nft insert rule inet fw4 forward oifname "$d" counter accept comment \"mihomo_tun_fwd\" 2>/dev/null
+					nft insert rule inet fw4 forward iifname "$d" counter accept comment \"mihomo_tun_fwd\" 2>/dev/null
+				fi
+				if nft list chain inet fw4 input >/dev/null 2>&1; then
+					nft insert rule inet fw4 input iifname "$d" counter accept comment \"mihomo_tun_in\" 2>/dev/null
+				fi
+
+				# 清理已有 UDP 连接跟踪，确保立即可走新路由
+				conntrack -D -p udp >/dev/null 2>&1 || true
+
+				logger -t mihomo "Added UDP policy route and fw4 rules for TUN device: ${d} (table ${rt_table})"
 				return 0
 			fi
 		done
 		sleep 1
 		i=$((i + 1))
 	done
-	logger -t mihomo "Warning: TUN device (${devs}) did not appear within 30s"
+	logger -t mihomo "Warning: TUN device (${devs}) did not appear within 30s. Check tun.enable in config.yaml!"
 	return 1
+}
+
+cleanup_fw4_tun_rules() {
+	local chain handle
+	for chain in forward input; do
+		if nft list chain inet fw4 "$chain" >/dev/null 2>&1; then
+			for handle in $(nft -a list chain inet fw4 "$chain" 2>/dev/null | awk '/mihomo_tun_/ {print $NF}'); do
+				nft delete rule inet fw4 "$chain" handle "$handle" 2>/dev/null
+			done
+		fi
+	done
 }
 
 setup_cron() {
@@ -290,9 +316,10 @@ setup_firewall() {
 				echo "		tcp dport { 53, ${dns_port} } return"
 			fi
 			if [ "$proxy_udp" != "0" ]; then
-				echo "		ip daddr 198.18.0.0/15 meta l4proto udp meta mark set ${FW_MARK} accept"
+				echo "		ip daddr 198.18.0.0/15 meta l4proto udp counter meta mark set ${FW_MARK} accept"
 				echo "		ip daddr @bypass_ipv4 return"
-				echo "		meta l4proto udp meta mark set ${FW_MARK} accept"
+				echo "		fib daddr type local return"
+				echo "		meta l4proto udp counter meta mark set ${FW_MARK} accept"
 			fi
 			echo "	}"
 			echo "	chain dstnat {"
@@ -310,15 +337,15 @@ setup_firewall() {
 				echo "		udp dport ${dns_port} return"
 				echo "		tcp dport ${dns_port} return"
 			fi
-			echo "		ip daddr 198.18.0.0/15 meta l4proto tcp redirect to :${redir_port}"
+			echo "		ip daddr 198.18.0.0/15 meta l4proto tcp counter redirect to :${redir_port}"
 			echo "		ip daddr @bypass_ipv4 return"
 			echo "		fib daddr type local return"
-			echo "		meta l4proto tcp redirect to :${redir_port}"
+			echo "		meta l4proto tcp counter redirect to :${redir_port}"
 			echo "	}"
 			echo "	chain forward {"
 			echo "		type filter hook forward priority filter - 1; policy accept;"
-			echo "		oifname { ${nft_tun_devs} } accept"
-			echo "		iifname { ${nft_tun_devs} } accept"
+			echo "		oifname { ${nft_tun_devs} } counter accept"
+			echo "		iifname { ${nft_tun_devs} } counter accept"
 			echo "	}"
 			echo "}"
 		} > "$NFT_FILE"
@@ -340,6 +367,7 @@ setup_firewall() {
 
 cleanup_firewall() {
 	nft delete table inet "$NFT_TABLE" 2>/dev/null
+	cleanup_fw4_tun_rules
 	ip rule del fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
 	ip route flush table "$RT_TABLE" 2>/dev/null
 }
