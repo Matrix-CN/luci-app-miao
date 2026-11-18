@@ -9,7 +9,7 @@ PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
 LUCI_TITLE:=LuCI support for Mihomo
-LUCI_DEPENDS:=+luci-base +mihomo +kmod-nft-tproxy +kmod-nft-socket
+LUCI_DEPENDS:=+luci-base +mihomo +kmod-nft-tproxy +kmod-nft-socket +kmod-nft-nat
 LUCI_PKGARCH:=all
 
 include $(TOPDIR)/feeds/luci/luci.mk
