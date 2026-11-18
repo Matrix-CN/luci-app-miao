@@ -130,6 +130,7 @@ return view.extend({
 
 		o = s.taboption('basic', form.ListValue, 'proxy_mode', _('代理模式'));
 		o.value('tproxy', _('TProxy 模式 (nftables 透明代理)'));
+		o.value('redirect_tun', _('混合模式 (TCP: Redirect, UDP: TUN)'));
 		o.value('tun', _('TUN 模式 (由 Mihomo 接管网卡)'));
 		o.value('core_only', _('仅核心 (仅提供 Socks/HTTP 代理)'));
 		o.default = 'tproxy';
@@ -141,9 +142,10 @@ return view.extend({
 		o.rmempty = false;
 		o.default = 'br-lan';
 
-		o = s.taboption('interface', form.Flag, 'proxy_udp', _('代理 UDP 流量'), _('开启后将透明代理 UDP 流量（如 QUIC、游戏语音等，仅 TProxy 模式有效）'));
+		o = s.taboption('interface', form.Flag, 'proxy_udp', _('代理 UDP 流量'), _('开启后将透明代理 UDP 流量（如 QUIC、游戏语音等，仅 TProxy 与 TCP: Redirect / UDP: TUN 模式有效）'));
 		o.default = '1';
 		o.depends('proxy_mode', 'tproxy');
+		o.depends('proxy_mode', 'redirect_tun');
 
 		o = s.taboption('interface', form.DynamicList, 'bypass_src_ips', _('绕过源 IP'), _('指定不经过 Mihomo 透明代理的内网设备 IP 或网段'));
 		o.datatype = 'or(ip4addr, cidr4)';
@@ -152,6 +154,11 @@ return view.extend({
 		o = s.taboption('interface', form.DynamicList, 'bypass_src_macs', _('绕过源 MAC'), _('指定不经过 Mihomo 透明代理的内网设备 MAC 地址'));
 		o.datatype = 'macaddr';
 		o.placeholder = '00:11:22:33:44:55';
+
+		o = s.taboption('advanced', form.Value, 'redir_port', _('Redirect 端口'), _('需与 config.yaml 中的 redir-port 保持一致'));
+		o.datatype = 'port';
+		o.default = '7892';
+		o.depends('proxy_mode', 'redirect_tun');
 
 		o = s.taboption('advanced', form.Value, 'tproxy_port', _('TProxy 端口'), _('需与 config.yaml 中的 tproxy-port 保持一致'));
 		o.datatype = 'port';
