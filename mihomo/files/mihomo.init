@@ -9,11 +9,43 @@ PROG="/usr/libexec/mihomo-core"
 CONF_DIR="/etc/mihomo"
 NFT_TABLE="mihomo"
 NFT_FILE="/tmp/mihomo.nft"
+FW4_FWD_NFT="/usr/share/nftables.d/chain-pre/forward/99-mihomo-tun.nft"
+FW4_IN_NFT="/usr/share/nftables.d/chain-pre/input/99-mihomo-tun.nft"
+TUN_WAIT_PID="/var/run/mihomo-tun-wait.pid"
 FW_MARK="0x162"
 ROUTING_MARK="666"
 RT_TABLE="162"
-MIHOMO_UID="7890"
 CRON_FILE="/etc/crontabs/root"
+
+# --- 参数白名单校验函数 ---
+
+is_valid_port() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+is_valid_iface() {
+	echo "$1" | grep -qE '^[a-zA-Z0-9._-]+$'
+}
+
+is_valid_ip_or_cidr() {
+	echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
+}
+
+is_valid_mac() {
+	echo "$1" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
+}
+
+is_valid_cron_field() {
+	local val="$1" min="$2" max="$3"
+	[ "$val" = "*" ] && return 0
+	case "$val" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$val" -ge "$min" ] && [ "$val" -le "$max" ]
+}
 
 to_nft_str_set() {
 	local item res=""
@@ -33,6 +65,24 @@ to_nft_raw_set() {
 	echo "$res"
 }
 
+# --- YAML 安全解析（先剔除行尾注释） ---
+
+get_yaml_dns_enable() {
+	local conf="$1"
+	[ ! -f "$conf" ] && return
+	awk '
+		/^dns:/ { in_dns=1; next }
+		in_dns && /^[^ \t#]/ { in_dns=0 }
+		in_dns && /^[ \t]+enable:[ \t]*/ {
+			sub(/#.*/, "", $0)
+			sub(/^[ \t]+enable:[ \t]*/, "", $0)
+			gsub(/["'\'' \t\r]/, "", $0)
+			print tolower($0)
+			exit
+		}
+	' "$conf"
+}
+
 get_yaml_dns_port() {
 	local conf="$1"
 	[ ! -f "$conf" ] && return
@@ -40,6 +90,7 @@ get_yaml_dns_port() {
 		/^dns:/ { in_dns=1; next }
 		in_dns && /^[^ \t#]/ { in_dns=0 }
 		in_dns && /^[ \t]+listen:[ \t]*/ {
+			sub(/#.*/, "", $0)
 			sub(/.*:/, "", $0)
 			gsub(/[^0-9]/, "", $0)
 			print $0
@@ -53,7 +104,22 @@ get_yaml_redir_port() {
 	[ ! -f "$conf" ] && return
 	awk '
 		/^redir-port:[ \t]*/ {
+			sub(/#.*/, "", $0)
 			sub(/^redir-port:[ \t]*/, "", $0)
+			gsub(/[^0-9]/, "", $0)
+			print $0
+			exit
+		}
+	' "$conf"
+}
+
+get_yaml_tproxy_port() {
+	local conf="$1"
+	[ ! -f "$conf" ] && return
+	awk '
+		/^tproxy-port:[ \t]*/ {
+			sub(/#.*/, "", $0)
+			sub(/^tproxy-port:[ \t]*/, "", $0)
 			gsub(/[^0-9]/, "", $0)
 			print $0
 			exit
@@ -68,52 +134,32 @@ get_yaml_tun_device() {
 		/^tun:/ { in_tun=1; next }
 		in_tun && /^[^ \t#]/ { in_tun=0 }
 		in_tun && /^[ \t]+device:[ \t]*/ {
+			sub(/#.*/, "", $0)
 			sub(/^[ \t]+device:[ \t]*/, "", $0)
 			gsub(/["'\'' \t\r]/, "", $0)
-			sub(/#.*/, "", $0)
 			print $0
 			exit
 		}
 	' "$conf"
 }
 
-wait_for_tun_route() {
-	local rt_table="$1"
-	shift
-	local devs="$*"
-	local i=0 d
-	while [ $i -lt 30 ]; do
-		for d in $devs; do
-			if ip link show "$d" >/dev/null 2>&1; then
-				ip link set "$d" up 2>/dev/null
-				ip route replace default dev "$d" table "$rt_table" 2>/dev/null
-				sysctl -w "net.ipv4.conf.${d}.rp_filter=0" >/dev/null 2>&1
+# --- fw4 持久化 TUN 放行规则 ---
 
-				# 在 fw4 的 forward 链最前面放行 TUN 网卡流量，防止被 fw4 默认的 zone 策略 reject
-				if nft list chain inet fw4 forward >/dev/null 2>&1; then
-					nft insert rule inet fw4 forward oifname "$d" counter accept comment \"mihomo_tun_fwd\" 2>/dev/null
-					nft insert rule inet fw4 forward iifname "$d" counter accept comment \"mihomo_tun_fwd\" 2>/dev/null
-				fi
-				if nft list chain inet fw4 input >/dev/null 2>&1; then
-					nft insert rule inet fw4 input iifname "$d" counter accept comment \"mihomo_tun_in\" 2>/dev/null
-				fi
-
-				# 清理已有 UDP 连接跟踪，确保立即可走新路由
-				conntrack -D -p udp >/dev/null 2>&1 || true
-
-				logger -t mihomo "Added UDP policy route and fw4 rules for TUN device: ${d} (table ${rt_table})"
-				return 0
-			fi
-		done
-		sleep 1
-		i=$((i + 1))
-	done
-	logger -t mihomo "Warning: TUN device (${devs}) did not appear within 30s. Check tun.enable in config.yaml!"
-	return 1
+write_fw4_tun_includes() {
+	local dev="$1"
+	mkdir -p /usr/share/nftables.d/chain-pre/forward /usr/share/nftables.d/chain-pre/input
+	cat <<-EOF > "$FW4_FWD_NFT"
+		oifname "${dev}" counter accept comment "mihomo_tun_fwd"
+		iifname "${dev}" counter accept comment "mihomo_tun_fwd"
+	EOF
+	cat <<-EOF > "$FW4_IN_NFT"
+		iifname "${dev}" counter accept comment "mihomo_tun_in"
+	EOF
 }
 
 cleanup_fw4_tun_rules() {
 	local chain handle
+	rm -f "$FW4_FWD_NFT" "$FW4_IN_NFT"
 	for chain in forward input; do
 		if nft list chain inet fw4 "$chain" >/dev/null 2>&1; then
 			for handle in $(nft -a list chain inet fw4 "$chain" 2>/dev/null | awk '/mihomo_tun_/ {print $NF}'); do
@@ -122,6 +168,62 @@ cleanup_fw4_tun_rules() {
 		fi
 	done
 }
+
+kill_tun_waiter() {
+	if [ -f "$TUN_WAIT_PID" ]; then
+		local pid
+		pid="$(cat "$TUN_WAIT_PID" 2>/dev/null)"
+		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		rm -f "$TUN_WAIT_PID"
+	fi
+}
+
+wait_for_tun_route() {
+	local rt_table="$1"
+	shift
+	local devs="$*"
+	local i=0 d
+
+	echo $$ > "$TUN_WAIT_PID"
+
+	while [ $i -lt 30 ]; do
+		for d in $devs; do
+			if ip link show "$d" >/dev/null 2>&1; then
+				ip link set "$d" up 2>/dev/null
+				ip route replace default dev "$d" table "$rt_table" 2>/dev/null
+				sysctl -w "net.ipv4.conf.${d}.rp_filter=0" >/dev/null 2>&1
+
+				# 写入持久化 include 文件，确保 fw4 reload 后规则不丢失
+				write_fw4_tun_includes "$d"
+
+				# 立即热插入到当前 fw4 链，避免触发整表重载
+				if nft list chain inet fw4 forward >/dev/null 2>&1; then
+					nft insert rule inet fw4 forward oifname "$d" counter accept comment \"mihomo_tun_fwd\" 2>/dev/null
+					nft insert rule inet fw4 forward iifname "$d" counter accept comment \"mihomo_tun_fwd\" 2>/dev/null
+				fi
+				if nft list chain inet fw4 input >/dev/null 2>&1; then
+					nft insert rule inet fw4 input iifname "$d" counter accept comment \"mihomo_tun_in\" 2>/dev/null
+				fi
+
+				if command -v conntrack >/dev/null 2>&1; then
+					conntrack -D -p udp >/dev/null 2>&1 || true
+				fi
+
+				logger -t mihomo "Added UDP policy route and persistent fw4 rules for TUN device: ${d} (table ${rt_table})"
+				rm -f "$TUN_WAIT_PID"
+				return 0
+			fi
+		done
+		sleep 1
+		i=$((i + 1))
+	done
+
+	logger -t mihomo "Warning: TUN device (${devs}) did not appear within 30s. Check tun.enable in config.yaml!"
+	rm -f "$TUN_WAIT_PID"
+	return 1
+}
+
+# --- 定时重启任务（带严格注入校验） ---
 
 setup_cron() {
 	cleanup_cron
@@ -140,6 +242,13 @@ setup_cron() {
 	[ -z "$cron_minute" ] && cron_minute="0"
 	[ -z "$cron_weekday" ] && cron_weekday="*"
 
+	if ! is_valid_cron_field "$cron_minute" 0 59 || \
+	   ! is_valid_cron_field "$cron_hour" 0 23 || \
+	   ! is_valid_cron_field "$cron_weekday" 0 6; then
+		logger -t mihomo "Error: Invalid cron schedule parameters rejected."
+		return 1
+	fi
+
 	mkdir -p /etc/crontabs
 	touch "$CRON_FILE"
 	echo "${cron_minute} ${cron_hour} * * ${cron_weekday} /etc/init.d/mihomo restart # mihomo_cron" >> "$CRON_FILE"
@@ -154,10 +263,15 @@ cleanup_cron() {
 	fi
 }
 
+# --- 防火墙与透明代理配置 ---
+
 setup_firewall() {
 	cleanup_firewall
 
-	local enabled proxy_mode proxy_ifaces proxy_udp redir_port tproxy_port dns_port tun_device bypass_src_ips bypass_src_macs config_path
+	local enabled proxy_mode raw_ifaces proxy_udp redir_port tproxy_port dns_port dns_enable tun_device
+	local raw_ips raw_macs config_path
+	local valid_ifaces="" valid_ips="" valid_macs="" item
+
 	enabled="$(uci -q get mihomo.config.enabled)"
 	[ "$enabled" != "1" ] && return 0
 
@@ -165,9 +279,22 @@ setup_firewall() {
 	[ -z "$proxy_mode" ] && proxy_mode="tproxy"
 	[ "$proxy_mode" = "core_only" ] && return 0
 
-	proxy_ifaces="$(uci -q get mihomo.config.proxy_ifaces)"
-	if [ -z "$proxy_ifaces" ]; then
-		logger -t mihomo "Error: No proxy_ifaces configured in /etc/config/mihomo"
+	raw_ifaces="$(uci -q get mihomo.config.proxy_ifaces)"
+	for item in $raw_ifaces; do
+		if ! is_valid_iface "$item"; then
+			logger -t mihomo "Warning: Ignored invalid interface name: ${item}"
+			continue
+		fi
+		if [ -d "/sys/class/net/${item}/brport" ]; then
+			logger -t mihomo "Warning: '${item}' is a bridge port and cannot be matched directly in inet hook. Please select the L3 bridge interface (e.g. br-lan) instead."
+			continue
+		fi
+		valid_ifaces="${valid_ifaces} ${item}"
+	done
+	valid_ifaces="${valid_ifaces# }"
+
+	if [ -z "$valid_ifaces" ]; then
+		logger -t mihomo "Error: No valid L3 proxy_ifaces configured in /etc/config/mihomo"
 		return 1
 	fi
 
@@ -176,50 +303,56 @@ setup_firewall() {
 
 	proxy_udp="$(uci -q get mihomo.config.proxy_udp)"
 
+	# 统一端口优先级：UCI > YAML > 默认值
 	redir_port="$(uci -q get mihomo.config.redir_port)"
 	[ -z "$redir_port" ] && redir_port="$(get_yaml_redir_port "$config_path")"
-	[ -z "$redir_port" ] && redir_port="7892"
+	is_valid_port "$redir_port" || redir_port="7892"
 
 	tproxy_port="$(uci -q get mihomo.config.tproxy_port)"
-	[ -z "$tproxy_port" ] && tproxy_port="7893"
+	[ -z "$tproxy_port" ] && tproxy_port="$(get_yaml_tproxy_port "$config_path")"
+	is_valid_port "$tproxy_port" || tproxy_port="7893"
 
-	dns_port="$(get_yaml_dns_port "$config_path")"
-	[ -z "$dns_port" ] && dns_port="$(uci -q get mihomo.config.dns_port)"
+	dns_enable="$(get_yaml_dns_enable "$config_path")"
+	if [ "$dns_enable" = "false" ]; then
+		dns_port=""
+		logger -t mihomo "Info: dns.enable is false in config.yaml, skipping 53 port DNS hijack."
+	else
+		dns_port="$(uci -q get mihomo.config.dns_port)"
+		[ -z "$dns_port" ] && dns_port="$(get_yaml_dns_port "$config_path")"
+		is_valid_port "$dns_port" || dns_port=""
+	fi
 
 	tun_device="$(get_yaml_tun_device "$config_path")"
-	[ -z "$tun_device" ] && tun_device="Meta"
+	if [ -z "$tun_device" ] || ! is_valid_iface "$tun_device"; then
+		tun_device="Meta"
+	fi
 
-	bypass_src_ips="$(uci -q get mihomo.config.bypass_src_ips)"
-	[ -z "$bypass_src_ips" ] && bypass_src_ips="$(uci -q get mihomo.config.bypass_ips)"
-	bypass_src_macs="$(uci -q get mihomo.config.bypass_src_macs)"
+	raw_ips="$(uci -q get mihomo.config.bypass_src_ips)"
+	[ -z "$raw_ips" ] && raw_ips="$(uci -q get mihomo.config.bypass_ips)"
+	for item in $raw_ips; do
+		is_valid_ip_or_cidr "$item" && valid_ips="${valid_ips} ${item}"
+	done
+	valid_ips="${valid_ips# }"
+
+	raw_macs="$(uci -q get mihomo.config.bypass_src_macs)"
+	for item in $raw_macs; do
+		is_valid_mac "$item" && valid_macs="${valid_macs} ${item}"
+	done
+	valid_macs="${valid_macs# }"
 
 	modprobe nft_tproxy 2>/dev/null
 	modprobe nft_socket 2>/dev/null
 	modprobe nft_nat 2>/dev/null
 	modprobe tun 2>/dev/null
 
-	local l3_ifaces=""
-	local br_ports=""
-	local iface
-	for iface in $proxy_ifaces; do
-		if [ -d "/sys/class/net/${iface}/brport" ]; then
-			br_ports="${br_ports} ${iface}"
-			modprobe br_netfilter 2>/dev/null
-			sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1
-			sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null 2>&1
-		else
-			l3_ifaces="${l3_ifaces} ${iface}"
-		fi
-	done
+	local nft_all_ifaces
+	nft_all_ifaces="$(to_nft_str_set "$valid_ifaces")"
 
 	if [ "$proxy_mode" = "tproxy" ]; then
 		ip rule del fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
 		ip route flush table "$RT_TABLE" 2>/dev/null
 		ip rule add fwmark "$FW_MARK" table "$RT_TABLE" priority 100
 		ip route add local 0.0.0.0/0 dev lo table "$RT_TABLE"
-
-		local nft_all_ifaces
-		nft_all_ifaces="$(to_nft_str_set "$proxy_ifaces")"
 
 		{
 			echo "table inet ${NFT_TABLE} {"
@@ -231,20 +364,23 @@ setup_firewall() {
 			echo "	chain prerouting {"
 			echo "		type filter hook prerouting priority mangle; policy accept;"
 			echo "		meta nfproto != ipv4 return"
-			echo "		meta skuid ${MIHOMO_UID} return"
-			echo "		meta skgid ${MIHOMO_UID} return"
 			echo "		meta mark ${ROUTING_MARK} return"
 			echo "		iifname != { ${nft_all_ifaces} } return"
-			[ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return"
-			[ -n "$bypass_src_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$bypass_src_ips") } return"
+			[ -n "$valid_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$valid_macs") } return"
+			[ -n "$valid_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$valid_ips") } return"
 			if [ -n "$dns_port" ]; then
 				echo "		udp dport { 53, ${dns_port} } return"
 				echo "		tcp dport { 53, ${dns_port} } return"
 			fi
+			if [ "$proxy_udp" != "0" ]; then
+				echo "		meta l4proto { tcp, udp } socket transparent 1 meta mark set ${FW_MARK} accept"
+			else
+				echo "		meta l4proto tcp socket transparent 1 meta mark set ${FW_MARK} accept"
+			fi
 			echo "		ip daddr 198.18.0.0/15 meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept"
 			[ "$proxy_udp" != "0" ] && echo "		ip daddr 198.18.0.0/15 meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept"
 			echo "		ip daddr @bypass_ipv4 return"
-			echo "		meta l4proto tcp socket transparent 1 meta mark set ${FW_MARK} accept"
+			echo "		fib daddr type local return"
 			echo "		meta l4proto tcp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept"
 			[ "$proxy_udp" != "0" ] && echo "		meta l4proto udp tproxy ip to 127.0.0.1:${tproxy_port} meta mark set ${FW_MARK} accept"
 			echo "	}"
@@ -252,12 +388,10 @@ setup_firewall() {
 				echo "	chain dstnat {"
 				echo "		type nat hook prerouting priority dstnat - 1; policy accept;"
 				echo "		meta nfproto != ipv4 return"
-				echo "		meta skuid ${MIHOMO_UID} return"
-				echo "		meta skgid ${MIHOMO_UID} return"
 				echo "		meta mark ${ROUTING_MARK} return"
 				echo "		iifname != { ${nft_all_ifaces} } return"
-				[ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return"
-				[ -n "$bypass_src_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$bypass_src_ips") } return"
+				[ -n "$valid_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$valid_macs") } return"
+				[ -n "$valid_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$valid_ips") } return"
 				echo "		udp dport 53 redirect to :${dns_port}"
 				echo "		tcp dport 53 redirect to :${dns_port}"
 				echo "	}"
@@ -268,15 +402,17 @@ setup_firewall() {
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
-			logger -t mihomo "Successfully applied nftables TProxy rules for: ${proxy_ifaces} (DNS port: ${dns_port:-none})"
+			logger -t mihomo "Successfully applied nftables TProxy rules for: ${valid_ifaces} (TProxy: ${tproxy_port}, DNS: ${dns_port:-none})"
 		else
 			logger -t mihomo "Failed to apply nftables: ${err_msg}"
 			echo "nftables error: ${err_msg}" >&2
 		fi
 
 	elif [ "$proxy_mode" = "redirect_tun" ]; then
-		sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
-		sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+		# 仅对入站代理接口关闭 rp_filter，避免破坏 WAN 口防欺骗保护
+		for item in $valid_ifaces; do
+			sysctl -w "net.ipv4.conf.${item}.rp_filter=0" >/dev/null 2>&1
+		done
 
 		ip rule del fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
 		ip route flush table "$RT_TABLE" 2>/dev/null
@@ -291,10 +427,6 @@ setup_firewall() {
 			esac
 		done
 
-		local nft_all_ifaces nft_tun_devs
-		nft_all_ifaces="$(to_nft_str_set "$proxy_ifaces")"
-		nft_tun_devs="$(to_nft_str_set "$tun_devs")"
-
 		{
 			echo "table inet ${NFT_TABLE} {"
 			echo "	set bypass_ipv4 {"
@@ -305,12 +437,10 @@ setup_firewall() {
 			echo "	chain prerouting {"
 			echo "		type filter hook prerouting priority mangle; policy accept;"
 			echo "		meta nfproto != ipv4 return"
-			echo "		meta skuid ${MIHOMO_UID} return"
-			echo "		meta skgid ${MIHOMO_UID} return"
 			echo "		meta mark ${ROUTING_MARK} return"
 			echo "		iifname != { ${nft_all_ifaces} } return"
-			[ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return"
-			[ -n "$bypass_src_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$bypass_src_ips") } return"
+			[ -n "$valid_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$valid_macs") } return"
+			[ -n "$valid_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$valid_ips") } return"
 			if [ -n "$dns_port" ]; then
 				echo "		udp dport { 53, ${dns_port} } return"
 				echo "		tcp dport { 53, ${dns_port} } return"
@@ -325,12 +455,10 @@ setup_firewall() {
 			echo "	chain dstnat {"
 			echo "		type nat hook prerouting priority dstnat - 1; policy accept;"
 			echo "		meta nfproto != ipv4 return"
-			echo "		meta skuid ${MIHOMO_UID} return"
-			echo "		meta skgid ${MIHOMO_UID} return"
 			echo "		meta mark ${ROUTING_MARK} return"
 			echo "		iifname != { ${nft_all_ifaces} } return"
-			[ -n "$bypass_src_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$bypass_src_macs") } return"
-			[ -n "$bypass_src_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$bypass_src_ips") } return"
+			[ -n "$valid_macs" ] && echo "		ether saddr { $(to_nft_raw_set "$valid_macs") } return"
+			[ -n "$valid_ips" ] && echo "		ip saddr { $(to_nft_raw_set "$valid_ips") } return"
 			if [ -n "$dns_port" ]; then
 				echo "		udp dport 53 redirect to :${dns_port}"
 				echo "		tcp dport 53 redirect to :${dns_port}"
@@ -342,18 +470,13 @@ setup_firewall() {
 			echo "		fib daddr type local return"
 			echo "		meta l4proto tcp counter redirect to :${redir_port}"
 			echo "	}"
-			echo "	chain forward {"
-			echo "		type filter hook forward priority filter - 1; policy accept;"
-			echo "		oifname { ${nft_tun_devs} } counter accept"
-			echo "		iifname { ${nft_tun_devs} } counter accept"
-			echo "	}"
 			echo "}"
 		} > "$NFT_FILE"
 
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
-			logger -t mihomo "Successfully applied nftables Redirect+TUN rules for: ${proxy_ifaces} (Redir port: ${redir_port}, DNS port: ${dns_port:-none})"
+			logger -t mihomo "Successfully applied nftables Redirect+TUN rules for: ${valid_ifaces} (Redir: ${redir_port}, DNS: ${dns_port:-none})"
 		else
 			logger -t mihomo "Failed to apply nftables: ${err_msg}"
 			echo "nftables error: ${err_msg}" >&2
@@ -366,7 +489,9 @@ setup_firewall() {
 }
 
 cleanup_firewall() {
+	kill_tun_waiter
 	nft delete table inet "$NFT_TABLE" 2>/dev/null
+	rm -f "$NFT_FILE"
 	cleanup_fw4_tun_rules
 	ip rule del fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
 	ip route flush table "$RT_TABLE" 2>/dev/null
@@ -376,6 +501,7 @@ start_service() {
 	local enabled config_path
 	enabled="$(uci -q get mihomo.config.enabled)"
 	if [ "$enabled" != "1" ]; then
+		cleanup_firewall
 		cleanup_cron
 		return 0
 	fi
