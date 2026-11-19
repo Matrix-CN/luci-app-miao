@@ -6,6 +6,7 @@
 'require poll';
 'require ui';
 'require fs';
+'require dom';
 'require tools.widgets as widgets';
 
 var callServiceList = rpc.declare({
@@ -38,19 +39,42 @@ function getCoreVersion() {
 	});
 }
 
+function isSafeConfigPath(path) {
+	return typeof path === 'string' &&
+		path.startsWith('/etc/mihomo/') &&
+		path.length > '/etc/mihomo/'.length &&
+		!path.endsWith('/') &&
+		path.indexOf('..') === -1 &&
+		/^\/etc\/mihomo\/[a-zA-Z0-9._/-]+$/.test(path);
+}
+
 function renderStatus(isRunning, port, version) {
-	var spanTemp = '<em><span style="color:%s"><strong>%s %s</strong></span></em>';
-	var versionHtml = String.format('<span style="margin-left: 16px; color: #555;"><strong>%s:</strong> %s</span>',
-		_('内核版本'), version || _('未知'));
-	var renderHTML;
+	var safePort = /^[0-9]+$/.test(String(port)) ? String(port) : '9090';
+	var nodes = [
+		E('em', {}, [
+			E('span', { style: 'color:' + (isRunning ? 'green' : 'red') }, [
+				E('strong', {}, _('Mihomo') + ' ' + (isRunning ? _('运行中') : _('未运行')))
+			])
+		]),
+		E('span', { style: 'margin-left: 16px; color: #555;' }, [
+			E('strong', {}, _('内核版本') + ': '),
+			version || _('未知')
+		])
+	];
+
 	if (isRunning) {
-		var button = String.format('&#160;&#160;<a class="btn cbi-button" href="http://%s:%s/ui" target="_blank" rel="noreferrer noopener">%s</a>',
-			window.location.hostname, port || '9090', _('打开面板'));
-		renderHTML = String.format(spanTemp, 'green', _('Mihomo'), _('运行中')) + versionHtml + button;
-	} else {
-		renderHTML = String.format(spanTemp, 'red', _('Mihomo'), _('未运行')) + versionHtml;
+		nodes.push(
+			E('a', {
+				class: 'btn cbi-button',
+				style: 'margin-left: 12px;',
+				href: 'http://' + window.location.hostname + ':' + safePort + '/ui',
+				target: '_blank',
+				rel: 'noreferrer noopener'
+			}, _('打开面板'))
+		);
 	}
-	return renderHTML;
+
+	return nodes;
 }
 
 return view.extend({
@@ -75,8 +99,9 @@ return view.extend({
 		s.render = function () {
 			poll.add(function () {
 				return L.resolveDefault(getServiceStatus()).then(function (res) {
-					var view = document.getElementById('service_status');
-					if (view) view.innerHTML = renderStatus(res, uiPort, coreVersion);
+					var viewEl = document.getElementById('service_status');
+					if (viewEl)
+						dom.content(viewEl, renderStatus(res, uiPort, coreVersion));
 				});
 			});
 
@@ -99,18 +124,23 @@ return view.extend({
 		o = s.taboption('basic', form.Value, 'config_path', _('配置文件路径'), _('存放在 /etc/mihomo/ 目录下的 YAML 配置文件路径，可点击右侧按钮直接上传并替换'));
 		o.default = '/etc/mihomo/config.yaml';
 		o.rmempty = false;
+		o.validate = function(section_id, value) {
+			if (!isSafeConfigPath(value ? value.trim() : ''))
+				return _('路径必须位于 /etc/mihomo/ 目录下且不能包含非法字符或 ..');
+			return true;
+		};
 		o.renderWidget = function(section_id, option_index, cfgvalue) {
 			var node = form.Value.prototype.renderWidget.apply(this, [section_id, option_index, cfgvalue]);
 
-			return E('div', { 'style': 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
+			return E('div', { style: 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
 				node,
 				E('button', {
-					'class': 'btn cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, function(ev) {
+					class: 'btn cbi-button cbi-button-action',
+					click: ui.createHandlerFn(this, function(ev) {
 						var inputEl = node.querySelector('input') || node;
 						var currentPath = (inputEl && inputEl.value) ? inputEl.value.trim() : '/etc/mihomo/config.yaml';
 
-						if (!currentPath.startsWith('/etc/mihomo/') || currentPath === '/etc/mihomo/') {
+						if (!isSafeConfigPath(currentPath)) {
 							currentPath = '/etc/mihomo/config.yaml';
 						}
 
@@ -134,14 +164,14 @@ return view.extend({
 		o.value('core_only', _('仅核心 (仅提供 Socks/HTTP 代理)'));
 		o.default = 'tproxy';
 
-		o = s.taboption('interface', widgets.DeviceSelect, 'proxy_ifaces', _('代理接口'), _('需要经过 Mihomo 透明代理的接口，如 br-lan, eth1, eth2, phy0-ap0 等'));
+		o = s.taboption('interface', widgets.DeviceSelect, 'proxy_ifaces', _('代理接口'), _('需要经过 Mihomo 透明代理的三层接口（如 br-lan 或独立 VLAN 接口；请勿直接选择网桥子端口）'));
 		o.multiple = true;
 		o.noaliases = true;
 		o.nobridges = false;
 		o.rmempty = false;
 		o.default = 'br-lan';
 
-		o = s.taboption('interface', form.Flag, 'proxy_udp', _('代理 UDP 流量'), _('开启后将透明代理 UDP 流量（如 QUIC、游戏语音等，仅 TProxy 与 TCP: Redirect / UDP: TUN 模式有效）'));
+		o = s.taboption('interface', form.Flag, 'proxy_udp', _('代理 UDP 流量'), _('开启后将透明代理 UDP 流量（如 QUIC、游戏语音等，仅 TProxy 与混合模式有效）'));
 		o.default = '1';
 		o.depends('proxy_mode', 'tproxy');
 		o.depends('proxy_mode', 'redirect_tun');
@@ -154,7 +184,7 @@ return view.extend({
 		o.datatype = 'macaddr';
 		o.placeholder = '00:11:22:33:44:55';
 
-		o = s.taboption('advanced', form.Value, 'redir_port', _('Redirect 端口'), _('需与 config.yaml 中的 redir-port 保持一致'));
+		o = s.taboption('advanced', form.Value, 'redir_port', _('Redirect 端口'), _('需与 config.yaml 中的 redir-port 保持一致（建议监听 0.0.0.0）'));
 		o.datatype = 'port';
 		o.default = '7892';
 		o.depends('proxy_mode', 'redirect_tun');
@@ -164,7 +194,7 @@ return view.extend({
 		o.default = '7893';
 		o.depends('proxy_mode', 'tproxy');
 
-		o = s.taboption('advanced', form.Value, 'dns_port', _('DNS 重定向端口'), _('劫持局域网 53 端口 DNS 请求并转发至 Mihomo 的 dns.listen 端口'));
+		o = s.taboption('advanced', form.Value, 'dns_port', _('DNS 重定向端口'), _('劫持局域网 53 端口 DNS 请求并转发至 Mihomo 的 dns.listen 端口（需监听 0.0.0.0）'));
 		o.datatype = 'port';
 		o.default = '1053';
 
