@@ -5,11 +5,10 @@
 			"uci": [ "mihomo" ],
 			"ubus": {
 				"service": [ "list" ],
-				"file": [ "list", "stat", "read", "exec" ]
+				"file": [ "stat", "exec" ]
 			},
 			"file": {
 				"/etc/mihomo/*": [ "read" ],
-				"/etc/mihomo": [ "list" ],
 				"/usr/libexec/mihomo-core": [ "exec" ]
 			}
 		},
@@ -17,7 +16,7 @@
 			"uci": [ "mihomo" ],
 			"cgi-io": [ "upload" ],
 			"ubus": {
-				"file": [ "write", "remove", "exec" ]
+				"file": [ "write" ]
 			},
 			"file": {
 				"/etc/mihomo/*": [ "write" ]
