@@ -131,7 +131,6 @@ return view.extend({
 		o = s.taboption('basic', form.ListValue, 'proxy_mode', _('代理模式'));
 		o.value('tproxy', _('TProxy 模式 (nftables 透明代理)'));
 		o.value('redirect_tun', _('混合模式 (TCP: Redirect, UDP: TUN)'));
-		o.value('tun', _('TUN 模式 (由 Mihomo 接管网卡)'));
 		o.value('core_only', _('仅核心 (仅提供 Socks/HTTP 代理)'));
 		o.default = 'tproxy';
 
