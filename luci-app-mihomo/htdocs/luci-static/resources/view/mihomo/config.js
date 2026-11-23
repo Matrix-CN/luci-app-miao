@@ -163,6 +163,32 @@ return view.extend({
 		o.value('redirect_tun', _('混合模式 (TCP: Redirect, UDP: TUN)'));
 		o.value('core_only', _('仅核心 (仅提供 Socks/HTTP 代理)'));
 		o.default = 'tproxy';
+		o.onchange = function(ev, section_id, value) {
+			var tunOpt = this.map.lookupOption('tun_enable', section_id);
+			if (tunOpt && tunOpt[0]) {
+				var tunEl = tunOpt[0].getUIElement(section_id);
+				var targetVal = null;
+				if (value === 'tproxy') {
+					targetVal = false;
+				} else if (value === 'redirect_tun') {
+					targetVal = true;
+				}
+				if (targetVal !== null && tunEl) {
+					if (typeof tunEl.setValue === 'function') {
+						tunEl.setValue(targetVal);
+					}
+					var cb = tunEl.node ? tunEl.node.querySelector('input[type="checkbox"]') : null;
+					if (cb) {
+						cb.checked = targetVal;
+						cb.dispatchEvent(new Event('change', { bubbles: true }));
+					}
+				}
+			}
+		};
+
+		o = s.taboption('basic', form.Flag, 'tun_enable', _('启用 TUN'), _('控制 Mihomo 内核的 TUN 开关：TProxy 模式下强制关闭，Redirect 混合模式下自动打开（可手动开关）'));
+		o.default = '0';
+		o.rmempty = false;
 
 		o = s.taboption('interface', widgets.DeviceSelect, 'proxy_ifaces', _('代理接口'), _('需要经过 Mihomo 透明代理的三层接口（如 br-lan 或独立 VLAN 接口；请勿直接选择网桥子端口）'));
 		o.multiple = true;
