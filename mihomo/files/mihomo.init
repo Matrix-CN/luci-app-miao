@@ -7,6 +7,7 @@ USE_PROCD=1
 
 PROG="/usr/libexec/mihomo-core"
 CONF_DIR="/etc/mihomo"
+RUNTIME_CONF="/tmp/mihomo-runtime.yaml"
 NFT_TABLE="mihomo"
 NFT_FILE="/tmp/mihomo.nft"
 FW4_FWD_NFT="/usr/share/nftables.d/chain-pre/forward/99-mihomo-tun.nft"
@@ -63,6 +64,90 @@ to_nft_raw_set() {
 		res="${res}${item}"
 	done
 	echo "$res"
+}
+
+# --- TUN 开关策略与运行时 YAML 生成 ---
+
+resolve_tun_enable() {
+	local proxy_mode tun_enable
+	proxy_mode="$(uci -q get mihomo.config.proxy_mode)"
+	[ -z "$proxy_mode" ] && proxy_mode="tproxy"
+	tun_enable="$(uci -q get mihomo.config.tun_enable)"
+
+	if [ "$proxy_mode" = "tproxy" ]; then
+		# TProxy 模式强制关闭 TUN
+		echo "0"
+	elif [ "$proxy_mode" = "redirect_tun" ]; then
+		# Redirect 混合模式默认开启 TUN，仅当用户显式关闭时为 0
+		if [ "$tun_enable" = "0" ]; then
+			echo "0"
+		else
+			echo "1"
+		fi
+	else
+		# 仅核心模式按用户开关控制，默认关闭
+		if [ "$tun_enable" = "1" ]; then
+			echo "1"
+		else
+			echo "0"
+		fi
+	fi
+}
+
+prepare_runtime_config() {
+	local src_conf="$1"
+	local dst_conf="$2"
+	local tun_enable="$3"
+	local target_bool="false"
+	[ "$tun_enable" = "1" ] && target_bool="true"
+
+	awk -v target="$target_bool" '
+		BEGIN {
+			in_tun = 0
+			has_tun = 0
+			replaced = 0
+		}
+		{
+			sub(/\r$/, "", $0)
+		}
+		/^tun:[ \t]*(\{\})?[ \t]*(#.*)?$/ {
+			in_tun = 1
+			has_tun = 1
+			print "tun:"
+			next
+		}
+		in_tun && /^[^ \t#]/ {
+			if (!replaced) {
+				print "  enable: " target
+				replaced = 1
+			}
+			in_tun = 0
+		}
+		in_tun && /^[ \t]+enable:[ \t]*/ {
+			match($0, /^[ \t]+/)
+			indent = substr($0, RSTART, RLENGTH)
+			print indent "enable: " target
+			replaced = 1
+			next
+		}
+		{
+			print $0
+		}
+		END {
+			if (in_tun && !replaced) {
+				print "  enable: " target
+			} else if (!has_tun && target == "true") {
+				print ""
+				print "tun:"
+				print "  enable: true"
+				print "  stack: system"
+				print "  auto-route: false"
+				print "  auto-detect-interface: true"
+				print "  dns-hijack:"
+				print "    - any:53"
+			}
+		}
+	' "$src_conf" > "$dst_conf"
 }
 
 # --- YAML 安全解析（先剔除行尾注释） ---
@@ -218,7 +303,7 @@ wait_for_tun_route() {
 		i=$((i + 1))
 	done
 
-	logger -t mihomo "Warning: TUN device (${devs}) did not appear within 30s. Check tun.enable in config.yaml!"
+	logger -t mihomo "Warning: TUN device (${devs}) did not appear within 30s. Check tun settings in config.yaml!"
 	rm -f "$TUN_WAIT_PID"
 	return 1
 }
@@ -268,7 +353,7 @@ cleanup_cron() {
 setup_firewall() {
 	cleanup_firewall
 
-	local enabled proxy_mode raw_ifaces proxy_udp redir_port tproxy_port dns_port dns_enable tun_device
+	local enabled proxy_mode tun_enable raw_ifaces proxy_udp redir_port tproxy_port dns_port dns_enable tun_device
 	local raw_ips raw_macs config_path
 	local valid_ifaces="" valid_ips="" valid_macs="" item
 
@@ -278,6 +363,8 @@ setup_firewall() {
 	proxy_mode="$(uci -q get mihomo.config.proxy_mode)"
 	[ -z "$proxy_mode" ] && proxy_mode="tproxy"
 	[ "$proxy_mode" = "core_only" ] && return 0
+
+	tun_enable="$(resolve_tun_enable)"
 
 	raw_ifaces="$(uci -q get mihomo.config.proxy_ifaces)"
 	for item in $raw_ifaces; do
@@ -402,21 +489,26 @@ setup_firewall() {
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
-			logger -t mihomo "Successfully applied nftables TProxy rules for: ${valid_ifaces} (TProxy: ${tproxy_port}, DNS: ${dns_port:-none})"
+			logger -t mihomo "Successfully applied nftables TProxy rules for: ${valid_ifaces} (TProxy: ${tproxy_port}, TUN: disabled, DNS: ${dns_port:-none})"
 		else
 			logger -t mihomo "Failed to apply nftables: ${err_msg}"
 			echo "nftables error: ${err_msg}" >&2
 		fi
 
 	elif [ "$proxy_mode" = "redirect_tun" ]; then
-		# 仅对入站代理接口关闭 rp_filter，避免破坏 WAN 口防欺骗保护
-		for item in $valid_ifaces; do
-			sysctl -w "net.ipv4.conf.${item}.rp_filter=0" >/dev/null 2>&1
-		done
+		local use_udp_tun="0"
+		[ "$proxy_udp" != "0" ] && [ "$tun_enable" = "1" ] && use_udp_tun="1"
 
 		ip rule del fwmark "$FW_MARK" table "$RT_TABLE" 2>/dev/null
 		ip route flush table "$RT_TABLE" 2>/dev/null
-		ip rule add fwmark "$FW_MARK" table "$RT_TABLE" priority 100
+
+		if [ "$use_udp_tun" = "1" ]; then
+			# 仅对入站代理接口关闭 rp_filter，避免破坏 WAN 口防欺骗保护
+			for item in $valid_ifaces; do
+				sysctl -w "net.ipv4.conf.${item}.rp_filter=0" >/dev/null 2>&1
+			done
+			ip rule add fwmark "$FW_MARK" table "$RT_TABLE" priority 100
+		fi
 
 		local tun_devs="$tun_device"
 		local d
@@ -445,7 +537,7 @@ setup_firewall() {
 				echo "		udp dport { 53, ${dns_port} } return"
 				echo "		tcp dport { 53, ${dns_port} } return"
 			fi
-			if [ "$proxy_udp" != "0" ]; then
+			if [ "$use_udp_tun" = "1" ]; then
 				echo "		ip daddr 198.18.0.0/15 meta l4proto udp counter meta mark set ${FW_MARK} accept"
 				echo "		ip daddr @bypass_ipv4 return"
 				echo "		fib daddr type local return"
@@ -476,13 +568,13 @@ setup_firewall() {
 		local err_msg
 		err_msg="$(nft -f "$NFT_FILE" 2>&1)"
 		if [ $? -eq 0 ]; then
-			logger -t mihomo "Successfully applied nftables Redirect+TUN rules for: ${valid_ifaces} (Redir: ${redir_port}, DNS: ${dns_port:-none})"
+			logger -t mihomo "Successfully applied nftables Redirect+TUN rules for: ${valid_ifaces} (Redir: ${redir_port}, TUN: ${tun_enable}, DNS: ${dns_port:-none})"
 		else
 			logger -t mihomo "Failed to apply nftables: ${err_msg}"
 			echo "nftables error: ${err_msg}" >&2
 		fi
 
-		if [ "$proxy_udp" != "0" ]; then
+		if [ "$use_udp_tun" = "1" ]; then
 			wait_for_tun_route "$RT_TABLE" $tun_devs &
 		fi
 	fi
@@ -498,11 +590,12 @@ cleanup_firewall() {
 }
 
 start_service() {
-	local enabled config_path
+	local enabled config_path tun_enable run_conf
 	enabled="$(uci -q get mihomo.config.enabled)"
 	if [ "$enabled" != "1" ]; then
 		cleanup_firewall
 		cleanup_cron
+		rm -f "$RUNTIME_CONF"
 		return 0
 	fi
 
@@ -513,8 +606,17 @@ start_service() {
 		cp /etc/mihomo/example.yaml "$config_path" 2>/dev/null
 	fi
 
+	tun_enable="$(resolve_tun_enable)"
+	if [ -f "$config_path" ] && prepare_runtime_config "$config_path" "$RUNTIME_CONF" "$tun_enable"; then
+		run_conf="$RUNTIME_CONF"
+		logger -t mihomo "Generated runtime config at ${RUNTIME_CONF} (tun.enable=$( [ "$tun_enable" = "1" ] && echo true || echo false ))"
+	else
+		run_conf="$config_path"
+		logger -t mihomo "Warning: Failed to generate runtime config, falling back to ${config_path}"
+	fi
+
 	procd_open_instance "mihomo"
-	procd_set_param command "$PROG" -d "$CONF_DIR" -f "$config_path"
+	procd_set_param command "$PROG" -d "$CONF_DIR" -f "$run_conf"
 	procd_set_param limits nofile="65535 65535"
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -528,6 +630,7 @@ start_service() {
 stop_service() {
 	cleanup_firewall
 	cleanup_cron
+	rm -f "$RUNTIME_CONF"
 }
 
 reload_service() {
